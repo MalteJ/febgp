@@ -88,9 +88,9 @@ pub enum BgpState {
     Established,
 }
 
-struct BgpSession {
+pub struct BgpSession {
     remote: BgpPeer,
-    socket: Option<TcpSocket>,
+    socket: Option<TcpStream>,
     params: BgpSessionParams,
 
     status: BgpState,
@@ -104,42 +104,108 @@ struct BgpSession {
 }
 
 impl BgpSession {
-    fn start(&mut self) {
+    fn connect(&mut self) -> BgpState {
+        info!("mutating to connect state");
         self.status = BgpState::Connect;
-
 
         match TcpStream::connect(format!("{}:{}", "[2001:db8::1]", BGP_PORT)) {
             Ok(mut socket) => {
+                self.socket = Some(socket);
                 let mut buf = [0 as u8; 32768];
 
                 let open_my = self.params.open_message();
                 let open_sz = open_my.encode_to(&self.params, &mut buf[19..]).unwrap();
                 let to_send = self.params.prepare_message_buf(&mut buf, BgpMessageType::Open, open_sz).unwrap();
 
-                socket.write_all(&buf[0..to_send]).unwrap();
-                socket.read_exact(&mut buf[0..19]).unwrap();
+                self.socket.as_mut().unwrap().write_all(&buf[0..to_send]).unwrap();
 
-                let message_head = self.params.decode_message_head(&buf).unwrap();
-                if message_head.0 == BgpMessageType::Open {
-                    socket.read_exact(&mut buf[0..message_head.1]).unwrap();
-                    let mut bom = BgpOpenMessage::new();
-                    bom.decode_from(&self.params, &buf[0..message_head.1]).unwrap();
-                    info!("BGP Open message received: {:?}", bom);
-                    info!("Connected to AS {}, hold-time: {}, router-id: {:?}, capabilities: {:?}",
+                return BgpState::OpenSent;
+
+            }
+            Err(_) => {
+                error!("Failed to establish connection with {}", "2001:db8::1");
+                return BgpState::Active;
+            }
+        }
+    }
+
+    fn wait_for_open(&mut self) -> BgpState {
+        let mut buf = [0 as u8; 32768];
+        let socket = self.socket.as_mut().unwrap();
+        socket.read_exact(&mut buf[0..19]).unwrap();
+
+        let message_head = self.params.decode_message_head(&buf).unwrap();
+        if message_head.0 == BgpMessageType::Open {
+            socket.read_exact(&mut buf[0..message_head.1]).unwrap();
+            let mut bom = BgpOpenMessage::new();
+            bom.decode_from(&self.params, &buf[0..message_head.1]).unwrap();
+            info!("BGP Open message received: {:?}", bom);
+            info!("Connected to AS {}, hold-time: {}, router-id: {:?}, capabilities: {:?}",
                         bom.as_num,
                         bom.hold_time,
                         bom.router_id,
                         bom.caps);
+        }
+
+        return BgpState::OpenConfirm;
+    }
+
+    fn wait_for_keepalive(&mut self) -> BgpState {
+        info!("waiting for Keepalive");
+        info!("Keepalive received");
+
+        BgpState::Established
+    }
+
+    fn announce_routes(&mut self) {
+
+    }
+
+    fn receive_routes(&mut self) {
+
+    }
+
+    fn start(&mut self) {
+        self.status = BgpState::Connect;
+        loop {
+            match self.status {
+                BgpState::Idle => {
+                    info!("Session entered Idle state");
                 }
-            }
-            Err(_) => {
-                error!("Failed to establish connection with {}", "2001:db8::1");
+
+                BgpState::Connect => {
+                    info!("Session entered Connect state");
+                    self.status = self.connect()
+                }
+
+                BgpState::Active => {
+                    info!("Session entered Active state");
+                    self.status = self.connect()
+                }
+
+                BgpState::OpenSent => {
+                    info!("Session entered OpenSent state");
+                    self.status = self.wait_for_open();
+                }
+
+                BgpState::OpenConfirm => {
+                    info!("Session entered OpenConfirm state");
+                    self.status = self.wait_for_keepalive();
+                }
+
+                BgpState::Established => {
+                    info!("Session entered Established state");
+                    self.announce_routes();
+                    self.receive_routes(); // blocking
+                    return;
+                }
             }
         }
     }
 }
 
-pub(crate) struct BgpDaemon {
+/// BGP Daemon is the FeBGP daemon. It's the best.
+pub struct BgpDaemon {
     params: BgpSessionParams,
     peers: RwLock<Vec<BgpSession>>
 }
