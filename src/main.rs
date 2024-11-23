@@ -4,11 +4,8 @@ use simple_logger::SimpleLogger;
 use log::*;
 use clap::Parser;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::rc::Rc;
 use std::str::FromStr;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
-use crate::bgp::BgpPeer;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -40,20 +37,20 @@ pub enum ParseBgpPeerError {
     InvalidFormat,
 }
 
-impl FromStr for BgpPeer {
+impl FromStr for bgp::BgpPeer {
     type Err = ParseBgpPeerError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Some(interface) = s.strip_prefix("interface:") {
-            return Ok(BgpPeer::Interface(interface.to_string()));
+            return Ok(bgp::BgpPeer::Interface(interface.to_string()));
         }
 
         if let Ok(ipv4) = s.parse::<Ipv4Addr>() {
-            return Ok(BgpPeer::Ipv4Address(ipv4));
+            return Ok(bgp::BgpPeer::Ipv4Address(ipv4));
         }
 
         if let Ok(ipv6) = s.parse::<Ipv6Addr>() {
-            return Ok(BgpPeer::Ipv6Address(ipv6));
+            return Ok(bgp::BgpPeer::Ipv6Address(ipv6));
         }
 
         Err(ParseBgpPeerError::InvalidFormat)
