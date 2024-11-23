@@ -8,7 +8,7 @@ FeBGP from the CLI:
 
     ./febgp \
         --asn 65000 \
-        --hold-time 9
+        --hold-time 9 \
         --router-id 1.2.3.4 \
         --neighbor 2001:db8::1 \
         --neighbor interface:eth0
