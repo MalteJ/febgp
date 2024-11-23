@@ -1,17 +1,15 @@
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, TcpStream};
-use std::rc::Rc;
 use std::sync::RwLock;
 use log::*;
 use zettabgp::prelude::*;
 use std::str::FromStr;
-use thiserror::Error;
 use tokio::net::TcpSocket;
 use std::io::{Read, Write};
 
 const BGP_PORT: u16 = 179;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Prefix {
     V4(Ipv4Addr, u8), // Holds an IPv4 address and prefix length
     V6(Ipv6Addr, u8), // Holds an IPv6 address and prefix length
