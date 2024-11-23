@@ -1,196 +1,13 @@
-use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpStream};
-use std::sync::RwLock;
-use log::*;
-use zettabgp::prelude::*;
-use std::str::FromStr;
-use std::io::{Read, Write};
-use tokio::runtime::Handle;
+use log::{debug, error, info, warn};
+use std::net::{Shutdown, TcpStream};
+use zettabgp::{BgpMessage, BgpSessionParams};
 use std::sync::mpsc::{Receiver, Sender};
+use zettabgp::message::{BgpMessageType, BgpOpenMessage, BgpUpdateMessage};
+use zettabgp::prelude::{BgpKeepaliveMessage, BgpNotificationMessage};
+use std::io::{Read, Write};
+use crate::febgp::BgpPeer;
 
 const BGP_PORT: u16 = 179;
-
-
-/// Trait to print BGP Notification messages with human-readable details.
-#[allow(unused)]
-pub trait NotificationPrinter {
-    fn print(&self);
-}
-
-impl NotificationPrinter for BgpNotificationMessage {
-    fn print(&self) {
-        let description = match (self.error_code, self.error_subcode) {
-            // Message Header Errors (Error Code 1)
-            (1, 1) => "Message Header Error: Connection Not Synchronized",
-            (1, 2) => "Message Header Error: Bad Message Length",
-            (1, 3) => "Message Header Error: Bad Message Type",
-
-            // OPEN Message Errors (Error Code 2)
-            (2, 1) => "OPEN Message Error: Unsupported Version Number",
-            (2, 2) => "OPEN Message Error: Bad Peer AS",
-            (2, 3) => "OPEN Message Error: Bad BGP Identifier",
-            (2, 4) => "OPEN Message Error: Unsupported Optional Parameter",
-
-            // Update Message Errors (Error Code 3)
-            (3, 1) => "UPDATE Message Error: Malformed Attribute List",
-            (3, 2) => "UPDATE Message Error: Unrecognized Well-Known Attribute",
-            (3, 3) => "UPDATE Message Error: Missing Well-Known Attribute",
-            (3, 4) => "UPDATE Message Error: Attribute Flags Error",
-            (3, 5) => "UPDATE Message Error: Attribute Length Error",
-            (3, 6) => "UPDATE Message Error: Invalid ORIGIN Attribute",
-            (3, 7) => "UPDATE Message Error: AS Routing Loop",
-            (3, 8) => "UPDATE Message Error: Invalid NEXT_HOP Attribute",
-            (3, 9) => "UPDATE Message Error: Optional Attribute Error",
-            (3, 10) => "UPDATE Message Error: Invalid Network Field",
-            (3, 11) => "UPDATE Message Error: Malformed AS_PATH",
-
-            // Hold Timer Expired (Error Code 4)
-            (4, 0) => "Hold Timer Expired",
-
-            // FSM Errors (Error Code 5)
-            (5, 0) => "FSM Error",
-
-            // Cease (Error Code 6)
-            (6, 1) => "Cease: Maximum Number of Prefixes Reached",
-            (6, 2) => "Cease: Administrative Shutdown",
-            (6, 3) => "Cease: Peer Deconfigured",
-            (6, 4) => "Cease: Administrative Reset",
-            (6, 5) => "Cease: Connection Rejected",
-            (6, 6) => "Cease: Other Configuration Change",
-            (6, 7) => "Cease: Connection Collision Resolution",
-            (6, 8) => "Cease: Out of Resources",
-
-            // Unknown errors
-            _ => "Unknown Notification Error",
-        };
-
-        println!("BGP Notification:");
-        println!("  Error Code: {:?}", self.error_code);
-        println!("  Error Subcode: {:?}", self.error_subcode);
-        println!("  Description: {}", description);
-        /* TODO
-        if !self.data.is_empty() {
-            println!("  Additional Data: {:?}", self.data);
-        }
-
-         */
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Prefix {
-    V4(Ipv4Addr, u8), // Holds an IPv4 address and prefix length
-    V6(Ipv6Addr, u8), // Holds an IPv6 address and prefix length
-}
-
-impl FromStr for Prefix {
-    type Err = String; // Error type for parsing
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Split the string into address and prefix parts
-        let parts: Vec<&str> = s.split('/').collect();
-        if parts.len() != 2 {
-            return Err("Invalid prefix format. Expected <IP>/<prefix_length>".to_string());
-        }
-
-        let addr = parts[0];
-        let prefix_length: u8 = parts[1]
-            .parse()
-            .map_err(|_| "Invalid prefix length".to_string())?;
-
-        if let Ok(ipv4) = addr.parse::<Ipv4Addr>() {
-            // IPv4 case
-            if prefix_length > 32 {
-                return Err("IPv4 prefix length cannot exceed 32".to_string());
-            }
-            Ok(Prefix::V4(ipv4, prefix_length))
-        } else if let Ok(ipv6) = addr.parse::<Ipv6Addr>() {
-            // IPv6 case
-            if prefix_length > 128 {
-                return Err("IPv6 prefix length cannot exceed 128".to_string());
-            }
-            Ok(Prefix::V6(ipv6, prefix_length))
-        } else {
-            Err("Invalid IP address".to_string())
-        }
-    }
-}
-
-impl fmt::Display for Prefix {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Prefix::V4(addr, length) => write!(f, "{}/{}", addr, length),
-            Prefix::V6(addr, length) => write!(f, "{}/{}", addr, length),
-        }
-    }
-}
-
-
-/// Represents a BGP peer, which can be an interface or an IP address (IPv4/IPv6).
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum BgpPeer {
-    Interface(String),
-    Ipv4Address(Ipv4Addr),
-    Ipv6Address(Ipv6Addr),
-}
-
-
-#[derive(Debug, PartialEq)]
-pub enum BgpState {
-    /// The initial state where BGP is idle and not attempting to connect.
-    Idle,
-
-    /// BGP is attempting to establish a TCP connection.
-    Connect,
-
-    /// BGP actively retries to connect after a failed attempt.
-    Active,
-
-    /// BGP has sent an OPEN message and is waiting for a response.
-    OpenSent,
-
-    /// BGP has received a valid OPEN message and is waiting for KEEPALIVE.
-    OpenConfirm,
-
-    /// The BGP session is fully established, and routes are exchanged.
-    Established,
-}
-
-/// Enum representing BGP events that trigger FSM state transitions.
-#[derive(Debug, PartialEq)]
-pub enum BgpEvent {
-    /// Operator manually starts the BGP session.
-    ManualStart,
-    // Operator manually stops the BGP session.
-    // TODO: ManualStop,
-    // Operator clears the BGP session.
-    // TODO: ManualClear,
-    // Operator restarts the BGP session.
-    // TODO: ManualRestart,
-    /// TCP transport connection is successfully established.
-    TransportEstablished,
-    /// TCP transport connection is closed or fails.
-    TransportClosed,
-    /// The FSM has sent an OPEN message.
-    OpenMessageSent,
-    /// The FSM receives a KEEPALIVE message.
-    OpenMessageReceived,
-    /// The FSM receives a KEEPALIVE message.
-    KeepaliveReceived,
-    /// The FSM receives an UPDATE message.
-    UpdateMessageReceived,
-    /// The FSM receives a NOTIFICATION message.
-    NotificationMessageReceived,
-    // Hold timer expires.
-    // TODO: HoldTimerExpired,
-    // Keepalive timer expires.
-    // TODO: KeepaliveTimerExpired,
-    // Connection retry timer expires.
-    // TODO: ConnectionRetryTimerExpired,
-    // The FSM receives an event indicating a collision with another BGP session.
-    // TODO: CollisionDetected,
-}
 
 pub struct BgpSession {
     _remote: BgpPeer,
@@ -198,7 +15,6 @@ pub struct BgpSession {
     params: BgpSessionParams,
     rx_event: Receiver<BgpEvent>,
     tx_event: Sender<BgpEvent>,
-    _rx_handle: Option<Handle>,
 
     status: BgpState,
     _connect_retry_counter: u32,
@@ -211,6 +27,23 @@ pub struct BgpSession {
 }
 
 impl BgpSession {
+    pub fn new(params: BgpSessionParams, rx: Receiver<BgpEvent>, tx: Sender<BgpEvent>, peer: BgpPeer) -> Self {
+        BgpSession{
+            params: params,
+            rx_event: rx,
+            tx_event: tx,
+            _remote: peer,
+            status: BgpState::Idle,
+            _connect_retry_counter: 0,
+            _connect_retry_timer: 0,
+            _connect_retry_time: 0,
+            _hold_timer: 0,
+            _hold_time: 0,
+            _keepalive_timer: 0,
+            socket: None,
+            _keepalive_time: 0,
+        }
+    }
     async fn connect(&mut self) -> BgpState {
         info!("mutating to connect state");
         self.status = BgpState::Connect;
@@ -329,7 +162,7 @@ impl BgpSession {
         self.rx_event.recv().unwrap()
     }
 
-    async fn start(&mut self) {
+    pub async fn start(&mut self) {
         self.status = BgpState::Idle;
         self.tx_event.send(BgpEvent::ManualStart).expect("TODO: panic message");
         debug!("YOLO!");
@@ -430,64 +263,124 @@ impl BgpSession {
     }
 }
 
-/// BGP Daemon is the FeBGP daemon. It's the best.
-pub struct BgpDaemon {
-    params: BgpSessionParams,
-    _peers: RwLock<Vec<BgpSession>>
+#[derive(Debug, PartialEq)]
+pub enum BgpState {
+    /// The initial state where BGP is idle and not attempting to connect.
+    Idle,
+
+    /// BGP is attempting to establish a TCP connection.
+    Connect,
+
+    /// BGP actively retries to connect after a failed attempt.
+    Active,
+
+    /// BGP has sent an OPEN message and is waiting for a response.
+    OpenSent,
+
+    /// BGP has received a valid OPEN message and is waiting for KEEPALIVE.
+    OpenConfirm,
+
+    /// The BGP session is fully established, and routes are exchanged.
+    Established,
 }
 
-impl BgpDaemon {
-    pub fn new(as_number: u32, hold_time: u16, router_id: Ipv4Addr) -> BgpDaemon {
-        let asn: u32;
-        if as_number > 2^16 - 1 {
-            asn = 23456;
-        } else {
-            asn = as_number;
-        }
+/// Enum representing BGP events that trigger FSM state transitions.
+#[derive(Debug, PartialEq)]
+pub enum BgpEvent {
+    /// Operator manually starts the BGP session.
+    ManualStart,
+    // Operator manually stops the BGP session.
+    // TODO: ManualStop,
+    // Operator clears the BGP session.
+    // TODO: ManualClear,
+    // Operator restarts the BGP session.
+    // TODO: ManualRestart,
+    /// TCP transport connection is successfully established.
+    TransportEstablished,
+    /// TCP transport connection is closed or fails.
+    TransportClosed,
+    /// The FSM has sent an OPEN message.
+    OpenMessageSent,
+    /// The FSM receives a KEEPALIVE message.
+    OpenMessageReceived,
+    /// The FSM receives a KEEPALIVE message.
+    KeepaliveReceived,
+    /// The FSM receives an UPDATE message.
+    UpdateMessageReceived,
+    /// The FSM receives a NOTIFICATION message.
+    NotificationMessageReceived,
+    // Hold timer expires.
+    // TODO: HoldTimerExpired,
+    // Keepalive timer expires.
+    // TODO: KeepaliveTimerExpired,
+    // Connection retry timer expires.
+    // TODO: ConnectionRetryTimerExpired,
+    // The FSM receives an event indicating a collision with another BGP session.
+    // TODO: CollisionDetected,
+}
 
-        let params = BgpSessionParams::new(
-            asn,
-            hold_time,
-            BgpTransportMode::IPv6,
-            router_id,
-            vec![
-                BgpCapability::SafiIPv6u,
-                BgpCapability::CapASN32(as_number),
-            ].into_iter().collect()
-        );
+/// Trait to print BGP Notification messages with human-readable details.
+#[allow(unused)]
+pub trait NotificationPrinter {
+    fn print(&self);
+}
 
-        BgpDaemon{ params: params, _peers: Default::default() }
-    }
+impl NotificationPrinter for BgpNotificationMessage {
+    fn print(&self) {
+        let description = match (self.error_code, self.error_subcode) {
+            // Message Header Errors (Error Code 1)
+            (1, 1) => "Message Header Error: Connection Not Synchronized",
+            (1, 2) => "Message Header Error: Bad Message Length",
+            (1, 3) => "Message Header Error: Bad Message Type",
 
-    pub fn add_neighbor(self: &mut Self, peer: BgpPeer) {
-        let (tx, rx) = std::sync::mpsc::channel();
+            // OPEN Message Errors (Error Code 2)
+            (2, 1) => "OPEN Message Error: Unsupported Version Number",
+            (2, 2) => "OPEN Message Error: Bad Peer AS",
+            (2, 3) => "OPEN Message Error: Bad BGP Identifier",
+            (2, 4) => "OPEN Message Error: Unsupported Optional Parameter",
 
-        let mut session = BgpSession{
-            params: self.params.clone(),
-            rx_event: rx,
-            tx_event: tx,
-            _rx_handle: None,
-            _remote: peer,
-            status: BgpState::Idle,
-            _connect_retry_counter: 0,
-            _connect_retry_timer: 0,
-            _connect_retry_time: 0,
-            _hold_timer: 0,
-            _hold_time: 0,
-            _keepalive_timer: 0,
-            socket: None,
-            _keepalive_time: 0,
+            // Update Message Errors (Error Code 3)
+            (3, 1) => "UPDATE Message Error: Malformed Attribute List",
+            (3, 2) => "UPDATE Message Error: Unrecognized Well-Known Attribute",
+            (3, 3) => "UPDATE Message Error: Missing Well-Known Attribute",
+            (3, 4) => "UPDATE Message Error: Attribute Flags Error",
+            (3, 5) => "UPDATE Message Error: Attribute Length Error",
+            (3, 6) => "UPDATE Message Error: Invalid ORIGIN Attribute",
+            (3, 7) => "UPDATE Message Error: AS Routing Loop",
+            (3, 8) => "UPDATE Message Error: Invalid NEXT_HOP Attribute",
+            (3, 9) => "UPDATE Message Error: Optional Attribute Error",
+            (3, 10) => "UPDATE Message Error: Invalid Network Field",
+            (3, 11) => "UPDATE Message Error: Malformed AS_PATH",
+
+            // Hold Timer Expired (Error Code 4)
+            (4, 0) => "Hold Timer Expired",
+
+            // FSM Errors (Error Code 5)
+            (5, 0) => "FSM Error",
+
+            // Cease (Error Code 6)
+            (6, 1) => "Cease: Maximum Number of Prefixes Reached",
+            (6, 2) => "Cease: Administrative Shutdown",
+            (6, 3) => "Cease: Peer Deconfigured",
+            (6, 4) => "Cease: Administrative Reset",
+            (6, 5) => "Cease: Connection Rejected",
+            (6, 6) => "Cease: Other Configuration Change",
+            (6, 7) => "Cease: Connection Collision Resolution",
+            (6, 8) => "Cease: Out of Resources",
+
+            // Unknown errors
+            _ => "Unknown Notification Error",
         };
 
-        tokio::spawn( async move {
-            session.start().await;
-        });
-    }
+        println!("BGP Notification:");
+        println!("  Error Code: {:?}", self.error_code);
+        println!("  Error Subcode: {:?}", self.error_subcode);
+        println!("  Description: {}", description);
+        /* TODO
+        if !self.data.is_empty() {
+            println!("  Additional Data: {:?}", self.data);
+        }
 
-    pub fn announce(self: &mut Self, prefix: Prefix) {
-        info!("announcing {}", prefix);
-    }
-
-    pub fn shutdown(self) {
+         */
     }
 }

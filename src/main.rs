@@ -1,4 +1,5 @@
-mod bgp;
+mod febgp;
+mod session;
 
 use simple_logger::SimpleLogger;
 use log::*;
@@ -24,7 +25,7 @@ struct Args {
 
     /// BGP neighbors
     #[arg(long = "neighbor", value_name = "NEIGHBOR", action = clap::ArgAction::Append)]
-    neighbors: Vec<bgp::BgpPeer>,
+    neighbors: Vec<febgp::BgpPeer>,
 }
 
 #[derive(Error, Debug)]
@@ -37,20 +38,20 @@ pub enum ParseBgpPeerError {
     InvalidFormat,
 }
 
-impl FromStr for bgp::BgpPeer {
+impl FromStr for febgp::BgpPeer {
     type Err = ParseBgpPeerError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Some(interface) = s.strip_prefix("interface:") {
-            return Ok(bgp::BgpPeer::Interface(interface.to_string()));
+            return Ok(febgp::BgpPeer::Interface(interface.to_string()));
         }
 
         if let Ok(ipv4) = s.parse::<Ipv4Addr>() {
-            return Ok(bgp::BgpPeer::Ipv4Address(ipv4));
+            return Ok(febgp::BgpPeer::Ipv4Address(ipv4));
         }
 
         if let Ok(ipv6) = s.parse::<Ipv6Addr>() {
-            return Ok(bgp::BgpPeer::Ipv6Address(ipv6));
+            return Ok(febgp::BgpPeer::Ipv6Address(ipv6));
         }
 
         Err(ParseBgpPeerError::InvalidFormat)
@@ -69,7 +70,7 @@ async fn main() {
     info!("Hold Time: {} seconds", args.hold_time);
     info!("Router ID: {}", args.router_id);
 
-    let mut febgp = bgp::BgpDaemon::new(args.asn, args.hold_time, args.router_id);
+    let mut febgp = febgp::BgpDaemon::new(args.asn, args.hold_time, args.router_id);
 
     for neighbor in args.neighbors {
         febgp.add_neighbor(neighbor);

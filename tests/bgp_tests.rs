@@ -1,4 +1,4 @@
-use febgp::bgp::*;
+use febgp::febgp::*;
 
 #[test]
 fn test_ipv4_prefix() {
