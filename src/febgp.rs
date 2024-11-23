@@ -7,16 +7,6 @@ use std::str::FromStr;
 use crate::session::BgpSession;
 
 
-/// Represents a BGP peer, which can be an interface or an IP address (IPv4/IPv6).
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum BgpPeer {
-    Interface(String),
-    Ipv4Address(Ipv4Addr),
-    Ipv6Address(Ipv6Addr),
-}
-
-
 /// BGP Daemon is the FeBGP daemon. It's the best.
 pub struct BgpDaemon {
     params: BgpSessionParams,
@@ -53,7 +43,7 @@ impl BgpDaemon {
         let mut session = BgpSession::new(params, rx, tx, peer);
 
         tokio::spawn( async move {
-            session.start().await;
+            session.start().await.unwrap();
         });
     }
 
@@ -63,6 +53,16 @@ impl BgpDaemon {
 
     pub fn shutdown(self) {
     }
+}
+
+
+/// Represents a BGP peer, which can be an interface or an IP address (IPv4/IPv6).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum BgpPeer {
+    Interface(String),
+    Ipv4Address(Ipv4Addr),
+    Ipv6Address(Ipv6Addr),
 }
 
 
