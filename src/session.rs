@@ -1,9 +1,7 @@
-use log::{debug, error, info, warn};
+use log::*;
 use std::net::{Shutdown, TcpStream};
-use zettabgp::{BgpMessage, BgpSessionParams};
 use std::sync::mpsc::{Receiver, Sender};
-use zettabgp::message::{BgpMessageType, BgpOpenMessage, BgpUpdateMessage};
-use zettabgp::prelude::{BgpKeepaliveMessage, BgpNotificationMessage};
+use zettabgp::prelude::*;
 use std::io::{Read, Write};
 use crate::febgp::BgpPeer;
 
@@ -73,7 +71,7 @@ impl BgpSession {
     fn receive(params: BgpSessionParams, mut socket: TcpStream, tx: Sender<BgpEvent>) {
         debug!("Started receive thread");
 
-        let mut buf = [0 as u8; 32768];
+        let mut buf = [0u8; 32768];
 
         loop {
             match socket.read_exact(&mut buf[0..19]) {
@@ -103,10 +101,7 @@ impl BgpSession {
                         // UPDATE
                         BgpMessageType::Update => {
                             socket.read_exact(&mut buf[0..message_head.1]).unwrap();
-                            debug!("Update received from {}", socket.peer_addr().unwrap());
                             let mut msg = BgpUpdateMessage::new();
-                            debug!("message_head: {:?}", message_head);
-                            debug!("msg size: {}", message_head.1);
                             msg.decode_from(&params, &buf[0..message_head.1]).unwrap();
                             debug!("Update received from {}: {:?}", socket.peer_addr().unwrap(), msg);
 
@@ -133,7 +128,7 @@ impl BgpSession {
     }
 
     async fn send_open(&mut self) -> BgpState {
-        let mut buf = [0 as u8; 32768];
+        let mut buf = [0u8; 32768];
 
         let open_my = self.params.open_message();
         let open_sz = open_my.encode_to(&self.params, &mut buf[19..]).unwrap();
@@ -146,7 +141,7 @@ impl BgpSession {
     }
 
     async fn send_keepalive(&mut self) {
-        let mut buf = [0 as u8; 32768];
+        let mut buf = [0u8; 32768];
 
         let keepalive_message = BgpKeepaliveMessage{};
         let open_sz = keepalive_message.encode_to(&self.params, &mut buf[19..]).unwrap();
@@ -163,7 +158,7 @@ impl BgpSession {
     fn reset_connection(&mut self) -> BgpState {
         self.socket.as_mut().unwrap().shutdown(Shutdown::Both).unwrap();
 
-        BgpState::Idle
+        BgpState::Idle // TODO: change to Active
     }
 
     async fn get_event(&mut self) -> BgpEvent {

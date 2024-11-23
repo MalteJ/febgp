@@ -1,6 +1,5 @@
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::RwLock;
 use log::*;
 use zettabgp::prelude::*;
 use std::str::FromStr;
@@ -10,7 +9,6 @@ use crate::session::BgpSession;
 /// BGP Daemon is the FeBGP daemon. It's the best.
 pub struct BgpDaemon {
     params: BgpSessionParams,
-    _peers: RwLock<Vec<BgpSession>>
 }
 
 impl BgpDaemon {
@@ -33,7 +31,7 @@ impl BgpDaemon {
             ].into_iter().collect()
         );
 
-        BgpDaemon{ params: params, _peers: Default::default() }
+        BgpDaemon{ params: params }
     }
 
     pub fn add_neighbor(self: &mut Self, peer: BgpPeer) {
@@ -45,6 +43,7 @@ impl BgpDaemon {
         tokio::spawn( async move {
             session.start().await.unwrap();
         });
+
     }
 
     pub fn announce(self: &mut Self, prefix: Prefix) {
