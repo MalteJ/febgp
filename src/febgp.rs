@@ -7,55 +7,6 @@ use std::str::FromStr;
 use crate::session::BgpSession;
 
 
-#[derive(Debug, PartialEq)]
-pub enum Prefix {
-    V4(Ipv4Addr, u8), // Holds an IPv4 address and prefix length
-    V6(Ipv6Addr, u8), // Holds an IPv6 address and prefix length
-}
-
-impl FromStr for Prefix {
-    type Err = String; // Error type for parsing
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Split the string into address and prefix parts
-        let parts: Vec<&str> = s.split('/').collect();
-        if parts.len() != 2 {
-            return Err("Invalid prefix format. Expected <IP>/<prefix_length>".to_string());
-        }
-
-        let addr = parts[0];
-        let prefix_length: u8 = parts[1]
-            .parse()
-            .map_err(|_| "Invalid prefix length".to_string())?;
-
-        if let Ok(ipv4) = addr.parse::<Ipv4Addr>() {
-            // IPv4 case
-            if prefix_length > 32 {
-                return Err("IPv4 prefix length cannot exceed 32".to_string());
-            }
-            Ok(Prefix::V4(ipv4, prefix_length))
-        } else if let Ok(ipv6) = addr.parse::<Ipv6Addr>() {
-            // IPv6 case
-            if prefix_length > 128 {
-                return Err("IPv6 prefix length cannot exceed 128".to_string());
-            }
-            Ok(Prefix::V6(ipv6, prefix_length))
-        } else {
-            Err("Invalid IP address".to_string())
-        }
-    }
-}
-
-impl fmt::Display for Prefix {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Prefix::V4(addr, length) => write!(f, "{}/{}", addr, length),
-            Prefix::V6(addr, length) => write!(f, "{}/{}", addr, length),
-        }
-    }
-}
-
-
 /// Represents a BGP peer, which can be an interface or an IP address (IPv4/IPv6).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -111,5 +62,54 @@ impl BgpDaemon {
     }
 
     pub fn shutdown(self) {
+    }
+}
+
+
+#[derive(Debug, PartialEq)]
+pub enum Prefix {
+    V4(Ipv4Addr, u8), // Holds an IPv4 address and prefix length
+    V6(Ipv6Addr, u8), // Holds an IPv6 address and prefix length
+}
+
+impl FromStr for Prefix {
+    type Err = String; // Error type for parsing
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Split the string into address and prefix parts
+        let parts: Vec<&str> = s.split('/').collect();
+        if parts.len() != 2 {
+            return Err("Invalid prefix format. Expected <IP>/<prefix_length>".to_string());
+        }
+
+        let addr = parts[0];
+        let prefix_length: u8 = parts[1]
+            .parse()
+            .map_err(|_| "Invalid prefix length".to_string())?;
+
+        if let Ok(ipv4) = addr.parse::<Ipv4Addr>() {
+            // IPv4 case
+            if prefix_length > 32 {
+                return Err("IPv4 prefix length cannot exceed 32".to_string());
+            }
+            Ok(Prefix::V4(ipv4, prefix_length))
+        } else if let Ok(ipv6) = addr.parse::<Ipv6Addr>() {
+            // IPv6 case
+            if prefix_length > 128 {
+                return Err("IPv6 prefix length cannot exceed 128".to_string());
+            }
+            Ok(Prefix::V6(ipv6, prefix_length))
+        } else {
+            Err("Invalid IP address".to_string())
+        }
+    }
+}
+
+impl fmt::Display for Prefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Prefix::V4(addr, length) => write!(f, "{}/{}", addr, length),
+            Prefix::V6(addr, length) => write!(f, "{}/{}", addr, length),
+        }
     }
 }
