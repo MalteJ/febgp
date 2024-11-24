@@ -3,12 +3,14 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use log::*;
 use zettabgp::prelude::*;
 use std::str::FromStr;
+use tokio::task::JoinHandle;
 use crate::session::BgpSession;
 
 
 /// BGP Daemon is the FeBGP daemon. It's the best.
 pub struct BgpDaemon {
     params: BgpSessionParams,
+    session_handles: Vec<JoinHandle<()>>,
 }
 
 impl BgpDaemon {
@@ -31,19 +33,21 @@ impl BgpDaemon {
             ].into_iter().collect()
         );
 
-        BgpDaemon{ params: params }
+        BgpDaemon{
+            params: params,
+            session_handles: vec![]
+        }
     }
 
     pub fn add_neighbor(self: &mut Self, peer: BgpPeer) {
         let (tx, rx) = std::sync::mpsc::channel();
         let params = self.params.clone();
 
-        let mut session = BgpSession::new(params, rx, tx, peer);
-
-        tokio::spawn( async move {
-            session.start().await.unwrap();
+        tokio::spawn(async move {
+            BgpSession::new(params, rx, tx, peer).start().await.unwrap();
         });
 
+        //self.session_handles.push(handle);
     }
 
     pub fn announce(self: &mut Self, prefix: Prefix) {
@@ -51,6 +55,9 @@ impl BgpDaemon {
     }
 
     pub fn shutdown(self) {
+        for handle in self.session_handles {
+            handle.abort();
+        }
     }
 }
 

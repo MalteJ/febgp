@@ -1,18 +1,20 @@
 use log::*;
-use std::net::{Shutdown, TcpStream};
+use tokio::net::TcpStream;
 use std::sync::mpsc::{Receiver, Sender};
 use zettabgp::prelude::*;
-use std::io::{Read, Write};
+use std::time::Duration;
+use tokio::io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::task::yield_now;
 use crate::febgp::BgpPeer;
 
 const BGP_PORT: u16 = 179;
 
 pub struct BgpSession {
     _remote: BgpPeer,
-    socket: Option<TcpStream>,
     params: BgpSessionParams,
     rx_event: Receiver<BgpEvent>,
     tx_event: Sender<BgpEvent>,
+    tx_socket: Option<WriteHalf<TcpStream>>,
 
     status: BgpState,
     _connect_retry_counter: u32,
@@ -30,6 +32,7 @@ impl BgpSession {
             params: params,
             rx_event: rx,
             tx_event: tx,
+            tx_socket: None,
             _remote: peer,
             status: BgpState::Idle,
             _connect_retry_counter: 0,
@@ -38,88 +41,86 @@ impl BgpSession {
             _hold_timer: 0,
             _hold_time: 0,
             _keepalive_timer: 0,
-            socket: None,
             _keepalive_time: 0,
         }
     }
-    async fn connect(&mut self) -> BgpState {
-        info!("mutating to connect state");
-        self.status = BgpState::Connect;
-
-        match TcpStream::connect(format!("{}:{}", "[2001:db8::1]", BGP_PORT)) {
+    async fn connect(&mut self) {
+        match TcpStream::connect(format!("{}:{}", "[2001:db8::1]", BGP_PORT)).await {
             Ok(socket) => {
-                self.socket = Some(socket);
-                self.tx_event.send(BgpEvent::TransportEstablished).unwrap();
+                let (rx, tx) = split(socket);
+                self.tx_socket = Some(tx);
 
-                let tx = self.tx_event.clone();
-                let sock = self.socket.as_mut().unwrap().try_clone().unwrap();
+                let tx_event = self.tx_event.clone();
+                //let sock = self.socket.as_mut().unwrap();
                 let params = self.params.clone();
-                std::thread::spawn(move || {
-                    BgpSession::receive(params, sock, tx);
+
+                tokio::spawn(async move {
+                    BgpSession::receive(params, rx, tx_event).await;
                 });
 
-                BgpState::Connect
+                warn!("Transport established!");
+                self.tx_event.send(BgpEvent::TransportEstablished).unwrap();
             }
             Err(_) => {
                 error!("Failed to establish connection with {}", "2001:db8::1");
                 self.tx_event.send(BgpEvent::TransportClosed).unwrap();
-                BgpState::Active
+
             }
         }
     }
 
-    fn receive(params: BgpSessionParams, mut socket: TcpStream, tx: Sender<BgpEvent>) {
-        debug!("Started receive thread");
+    async fn receive(params: BgpSessionParams, mut rx: ReadHalf<TcpStream>, tx: Sender<BgpEvent>) {
+        warn!("Started receive thread");
 
         let mut buf = [0u8; 32768];
 
         loop {
-            match socket.read_exact(&mut buf[0..19]) {
+            yield_now().await;
+            match rx.read_exact(&mut buf[0..19]).await {
                 Ok(_) => {
                     let message_head = params.decode_message_head(&buf).unwrap();
                     match message_head.0 {
 
                         // OPEN
                         BgpMessageType::Open => {
-                            socket.read_exact(&mut buf[0..message_head.1]).unwrap();
+                            rx.read_exact(&mut buf[0..message_head.1]).await.unwrap();
                             let mut msg = BgpOpenMessage::new();
                             msg.decode_from(&params, &buf[0..message_head.1]).unwrap();
-                            info!("Connected to AS {}, hold-time: {}, router-id: {:?}, capabilities: {:?}",
-                                msg.as_num,
-                                msg.hold_time,
-                                msg.router_id,
-                                msg.caps);
+                            //info!("Connected to AS {}, hold-time: {}, router-id: {:?}, capabilities: {:?}",
+                            //    msg.as_num,
+                            //    msg.hold_time,
+                            //    msg.router_id,
+                            //    msg.caps);
                             tx.send(BgpEvent::OpenMessageReceived).unwrap();
                         },
 
                         // KEEPALIVE
                         BgpMessageType::Keepalive => {
-                            debug!("Keepalive received from {}", socket.peer_addr().unwrap());
                             tx.send(BgpEvent::KeepaliveReceived).unwrap();
                         },
 
                         // UPDATE
                         BgpMessageType::Update => {
-                            socket.read_exact(&mut buf[0..message_head.1]).unwrap();
+                            rx.read_exact(&mut buf[0..message_head.1]).await.unwrap();
                             let mut msg = BgpUpdateMessage::new();
                             msg.decode_from(&params, &buf[0..message_head.1]).unwrap();
-                            debug!("Update received from {}: {:?}", socket.peer_addr().unwrap(), msg);
+                            //debug!("Update: {:?}", msg);
 
                             tx.send(BgpEvent::UpdateMessageReceived).unwrap();
                         },
 
                         // NOTIFICATION
                         BgpMessageType::Notification => {
-                            socket.read_exact(&mut buf[0..message_head.1]).unwrap();
+                            rx.read_exact(&mut buf[0..message_head.1]).await.unwrap();
                             let mut msg = BgpNotificationMessage::new();
                             msg.decode_from(&params, &buf[0..message_head.1]).unwrap();
-                            warn!("Notification received from {}: {}", socket.peer_addr().unwrap(), msg);
                             tx.send(BgpEvent::NotificationMessageReceived).unwrap();
                         }
                     }
                 }
                 Err(e) => {
                     debug!("Failed to read from socket: {}", e);
+                    drop(rx);
                     tx.send(BgpEvent::TransportClosed).unwrap();
                     return;
                 }
@@ -127,17 +128,24 @@ impl BgpSession {
         }
     }
 
-    async fn send_open(&mut self) -> BgpState {
+    async fn send_open(&mut self) {
         let mut buf = [0u8; 32768];
 
         let open_my = self.params.open_message();
         let open_sz = open_my.encode_to(&self.params, &mut buf[19..]).unwrap();
         let to_send = self.params.prepare_message_buf(&mut buf, BgpMessageType::Open, open_sz).unwrap();
 
-        self.socket.as_mut().unwrap().write_all(&buf[0..to_send]).unwrap();
+        match self.tx_socket {
+            Some(ref mut tx_socket) => {
+                tx_socket.write_all(&buf[0..to_send]).await.unwrap();
+            },
+            None => {
+                error!("Failed to send Open message");
+                self.tx_event.send(BgpEvent::TransportClosed).unwrap();
+            }
+        }
 
         self.tx_event.send(BgpEvent::OpenMessageSent).unwrap();
-        BgpState::OpenSent
     }
 
     async fn send_keepalive(&mut self) {
@@ -147,18 +155,30 @@ impl BgpSession {
         let open_sz = keepalive_message.encode_to(&self.params, &mut buf[19..]).unwrap();
         let to_send = self.params.prepare_message_buf(&mut buf, BgpMessageType::Keepalive, open_sz).unwrap();
 
-        self.socket.as_mut().unwrap().write_all(&buf[0..to_send]).unwrap();
-        debug!("Keepalive sent");
+        match self.tx_socket {
+            Some(ref mut tx_socket) => {
+                tx_socket.write_all(&buf[0..to_send]).await.unwrap();
+            },
+            None => {
+                error!("Failed to send Keepalive message");
+                self.tx_event.send(BgpEvent::TransportClosed).unwrap();
+            }
+        }
     }
 
     async fn send_updates(&mut self) {
         debug!("Sending updates");
     }
 
-    fn reset_connection(&mut self) -> BgpState {
-        self.socket.as_mut().unwrap().shutdown(Shutdown::Both).unwrap();
+    async fn reset_connection(&mut self) {
+        match self.tx_socket {
+            Some(ref mut tx_socket) => {
+                tx_socket.shutdown().await.unwrap();
+            },
+            None => {}
+        }
 
-        BgpState::Idle // TODO: change to Active
+        self.tx_event.send(BgpEvent::TransportClosed).unwrap();
     }
 
     async fn get_event(&mut self) -> BgpEvent {
@@ -175,108 +195,162 @@ impl BgpSession {
         Ok(())
     }
 
+    fn set_state(&mut self, state: BgpState) {
+        info!("BGP Status: {:?}", state);
+        self.status = state;
+    }
+
     async fn run_fsm(&mut self) {
         loop {
+            yield_now().await;
             match self.status {
 
                 BgpState::Idle => {
-                    info!("BGP State: Idle");
                     match self.get_event().await {
 
                         BgpEvent::ManualStart => {
-                            debug!("BGP Event: ManualStart");
-                            self.status = self.connect().await;
+                            info!("Idle: ManualStart");
+                            self.set_state(BgpState::Connect);
+                            self.connect().await;
                         },
                         event => {
-                            error!("Unexpected event received. State: {:?}, Event: {:?}", self.status, event);
-                            self.status = self.reset_connection();
+                            error!("Idle: Unexpected event received. Event: {:?}", event);
+                            self.reset_connection().await;
                         },
                     }
                 }
 
                 BgpState::Active => {
-                    info!("BGP State: Active");
-                    info!("Session entered Active state");
-                    self.status = self.connect().await
+                    match self.get_event().await {
+                        BgpEvent::TransportClosed => {
+                            info!("Active: TransportClosed - waiting 3s before trying to reconnect...");
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            self.connect().await;
+                        },
+                        BgpEvent::TransportEstablished => {
+                            info!("Active: TransportEstablished");
+                            self.send_open().await;
+                        },
+
+                        BgpEvent::OpenMessageSent => {
+                            info!("Active: OpenMessageSent");
+                            self.set_state(BgpState::OpenSent);
+                        }
+
+                        BgpEvent::OpenMessageReceived => {
+                            info!("Active: OpenMessageReceived");
+                            self.set_state(BgpState::OpenConfirm);
+                        }
+
+                        event => {
+                            info!("Active: Unexpected event received. Event: {:?}", event);
+                            self.reset_connection().await;
+                        },
+
+                    }
                 }
 
                 BgpState::Connect => {
-                    info!("BGP State: Connect");
                     match self.get_event().await {
 
                         BgpEvent::TransportEstablished => {
-                            debug!("BGP Event: TransportEstablished");
-                            self.status = self.send_open().await;
+                            info!("Connect: TransportEstablished");
+                            self.send_open().await;
                         },
 
                         BgpEvent::TransportClosed => {
-                            debug!("BGP Event: TransportClosed");
-                            self.status = BgpState::Active;
-                            self.status = self.connect().await;
+                            info!("Connect: TransportClosed - waiting 3s before trying to reconnect...");
+                            self.set_state(BgpState::Active);
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            self.connect().await;
                         },
 
+                        BgpEvent::OpenMessageSent => {
+                            info!("Connect: OpenMessageSent");
+                            self.set_state(BgpState::OpenSent);
+                        }
+
+                        BgpEvent::OpenMessageReceived => {
+                            info!("Connect: OpenMessageReceived");
+                            self.set_state(BgpState::OpenConfirm);
+                        }
+
                         event => {
-                            error!("Unexpected event received. State: {:?}, Event: {:?}", self.status, event);
-                            self.status = self.reset_connection();
+                            error!("Connect: Unexpected event received. Event: {:?}", event);
+                            self.reset_connection().await;
                         },
                     }
                 }
 
                 BgpState::OpenSent => {
-                    info!("BGP State: OpenSent");
                     match self.get_event().await {
 
-                        BgpEvent::OpenMessageSent => {
-                            debug!("BGP Event: OpenMessageSent");
-                        }
+                        BgpEvent::TransportClosed => {
+                            info!("OpenSent: TransportClosed - waiting 3s before trying to reconnect...");
+                            self.set_state(BgpState::Active);
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            self.connect().await;
+                        },
 
                         BgpEvent::OpenMessageReceived => {
-                            debug!("BGP Event: OpenMessageReceived");
-                            self.status = BgpState::OpenConfirm;
-                            self.send_keepalive().await;
+                            info!("OpenSent: OpenMessageReceived");
+                            self.set_state(BgpState::OpenConfirm);
                         }
 
                         event => {
-                            error!("Unexpected event received. State: {:?}, Event: {:?}", self.status, event);
-                            self.status = self.reset_connection();
+                            error!("OpenSent: Unexpected event received. Event: {:?}", event);
+                            self.reset_connection().await;
                         },
                     }
                 }
 
                 BgpState::OpenConfirm => {
-                    info!("BGP State: OpenConfirm");
                     match self.get_event().await {
 
                         BgpEvent::KeepaliveReceived => {
-                            debug!("BGP Event: KeepaliveReceived");
-                            self.status = BgpState::Established;
+                            info!("OpenConfirm: KeepaliveReceived");
+                            self.set_state(BgpState::Established);
+                            self.send_keepalive().await;
                             self.send_updates().await;
                         }
 
+                        BgpEvent::TransportClosed => {
+                            info!("OpenConfirm: TransportClosed - waiting 3s before trying to reconnect...");
+                            self.set_state(BgpState::Active);
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            self.connect().await;
+                        },
+
                         event => {
-                            error!("Unexpected event received. State: {:?}, Event: {:?}", self.status, event);
-                            self.status = self.reset_connection();
+                            error!("OpenConfirm: Unexpected event received. Event: {:?}", event);
+                            self.reset_connection().await;
                         },
                     }
                 }
 
                 BgpState::Established => {
-                    info!("BGP State: Established");
                     match self.get_event().await {
 
+                        BgpEvent::TransportClosed => {
+                            info!("Established: TransportClosed - waiting 3s before trying to reconnect...");
+                            self.set_state(BgpState::Active);
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            self.connect().await;
+                        },
+
                         BgpEvent::KeepaliveReceived => {
-                            debug!("BGP Event: KeepaliveReceived");
+                            info!("Established: KeepaliveReceived");
                             self.send_keepalive().await;
                         }
 
                         BgpEvent::UpdateMessageReceived => {
-                            debug!("BGP Event: UpdateMessageReceived");
+                            info!("Established: UpdateMessageReceived");
                             // TODO: Implement
                         }
 
                         event => {
-                            error!("Unexpected event received. State: {:?}, Event: {:?}", self.status, event);
-                            self.status = self.reset_connection();
+                            error!("Established: Unexpected event received. Event: {:?}", event);
+                            //self.reset_connection().await;
                         },
                     }
                 }
