@@ -236,6 +236,14 @@ impl GobgpInstance {
     }
 }
 
+impl GobgpInstance {
+    /// Stop the GoBGP instance explicitly (for testing withdrawal scenarios)
+    pub fn stop(&mut self) {
+        let _ = self.gobgpd.kill();
+        let _ = self.gobgpd.wait();
+    }
+}
+
 impl Drop for GobgpInstance {
     fn drop(&mut self) {
         let _ = self.gobgpd.kill();

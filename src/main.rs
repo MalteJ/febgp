@@ -306,6 +306,8 @@ async fn run_peer_session(
             SessionEvent::SessionDown { reason } => {
                 println!("Session to {} went down: {}", peer_addr, reason);
                 update_peer_state(&state, peer_idx, bgp::SessionState::Idle).await;
+                // Remove all routes from this peer
+                remove_peer_routes(&state, peer_idx).await;
                 established_at = None;
             }
             SessionEvent::UpdateReceived(data) => {
@@ -466,5 +468,37 @@ fn recalculate_best_paths(routes: &mut [RouteEntry], prefix: &str) {
                 route.best = route.as_path_len == min_len;
             }
         }
+    }
+}
+
+/// Remove all routes from a peer (called when session goes down).
+async fn remove_peer_routes(state: &Arc<RwLock<DaemonState>>, peer_idx: usize) {
+    let mut s = state.write().await;
+
+    // Collect prefixes that will be affected
+    let affected_prefixes: Vec<String> = s
+        .routes
+        .iter()
+        .filter(|r| r.peer_idx == peer_idx)
+        .map(|r| r.prefix.clone())
+        .collect();
+
+    // Remove routes from this peer
+    let removed_count = s.routes.len();
+    s.routes.retain(|r| r.peer_idx != peer_idx);
+    let removed_count = removed_count - s.routes.len();
+
+    // Update prefix count for this neighbor
+    if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
+        neighbor.prefixes_received = 0;
+    }
+
+    // Recalculate best paths for affected prefixes
+    for prefix in affected_prefixes {
+        recalculate_best_paths(&mut s.routes, &prefix);
+    }
+
+    if removed_count > 0 {
+        println!("Removed {} route(s) from peer {}", removed_count, peer_idx);
     }
 }
