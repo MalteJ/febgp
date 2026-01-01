@@ -136,14 +136,12 @@ fn run_febgp_in_namespace(
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let binary_path = workspace_root.join("target/debug/febgp-connect");
 
-    // Build the test helper if needed
-    let status = Command::new("cargo")
-        .args(["build", "-p", "tests-integration", "--bin", "febgp-connect"])
-        .current_dir(workspace_root)
-        .status()?;
-
-    if !status.success() {
-        return Err(std::io::Error::other("Failed to build febgp-connect"));
+    // Check that the binary exists (should be built by cargo test)
+    if !binary_path.exists() {
+        return Err(std::io::Error::other(format!(
+            "febgp-connect binary not found at {:?}. Run 'cargo build -p tests-integration' first.",
+            binary_path
+        )));
     }
 
     // Run the helper in the namespace

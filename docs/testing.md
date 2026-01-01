@@ -22,19 +22,12 @@ This will:
 
 ## Test Structure
 
-### `gobgp_to_gobgp`
-
-Baseline test that verifies two GoBGP instances can:
-- Establish a BGP session using IPv6 link-local addresses
-- Exchange IPv6 prefixes
-
-This confirms the test infrastructure works correctly.
-
 ### `febgp_to_gobgp`
 
 Tests FeBGP against GoBGP:
 - FeBGP connects to GoBGP using IPv6 link-local address
 - Verifies session reaches ESTABLISHED state
+- Confirms BGP capabilities are negotiated (IPv4 + IPv6 unicast, 4-octet AS)
 - Confirms the session is held for the expected duration
 
 ## Test Infrastructure
@@ -45,7 +38,7 @@ Tests use Linux network namespaces to create isolated network environments:
 ┌─────────────────┐     veth pair      ┌─────────────────┐
 │  febgp_test_r1  │◄──────────────────►│  febgp_test_r2  │
 │                 │    eth0 <-> eth0   │                 │
-│  FeBGP / GoBGP  │                    │     GoBGP       │
+│     FeBGP       │                    │     GoBGP       │
 └─────────────────┘                    └─────────────────┘
 ```
 

@@ -9,15 +9,11 @@ febgp = { path = ".." }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 libc = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 [[bin]]
 name = "febgp-connect"
 path = "src/bin/febgp_connect.rs"
-
-[[test]]
-name = "gobgp_to_gobgp"
-path = "src/gobgp_to_gobgp.rs"
-harness = true
 
 [[test]]
 name = "febgp_to_gobgp"

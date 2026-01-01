@@ -23,7 +23,11 @@ cargo build --release
 ### Run the daemon
 
 ```sh
-febgp daemon --config config.toml
+# Uses defaults: /etc/febgp/config.toml and /var/lib/febgp/grpc.sock
+febgp daemon
+
+# Or with custom paths
+febgp daemon --config /path/to/config.toml --socket /path/to/grpc.sock
 ```
 
 ### Query status

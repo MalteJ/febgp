@@ -47,6 +47,9 @@ impl GobgpConfig {
             config.push_str(&format!("    local-address = \"{}\"\n", neighbor.local_address));
             config.push_str("  [[neighbors.afi-safis]]\n");
             config.push_str("    [neighbors.afi-safis.config]\n");
+            config.push_str("      afi-safi-name = \"ipv4-unicast\"\n");
+            config.push_str("  [[neighbors.afi-safis]]\n");
+            config.push_str("    [neighbors.afi-safis.config]\n");
             config.push_str("      afi-safi-name = \"ipv6-unicast\"\n");
             config.push('\n');
         }
@@ -157,11 +160,31 @@ impl GobgpInstance {
         false
     }
 
-    /// Announce a prefix
+    /// Announce an IPv6 prefix
     #[allow(dead_code)]
     pub fn announce_prefix(&self, prefix: &str) -> io::Result<()> {
         self.gobgp(&["global", "rib", "add", prefix, "-a", "ipv6"])?;
         Ok(())
+    }
+
+    /// Announce an IPv4 prefix
+    #[allow(dead_code)]
+    pub fn announce_prefix_v4(&self, prefix: &str) -> io::Result<()> {
+        self.gobgp(&["global", "rib", "add", prefix, "-a", "ipv4"])?;
+        Ok(())
+    }
+
+    /// Check if an IPv4 prefix is received from BGP
+    #[allow(dead_code)]
+    pub fn has_prefix_v4(&self, prefix: &str) -> bool {
+        if let Ok(output) = self.gobgp(&["global", "rib", "-a", "ipv4", "-j"]) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output) {
+                if let Some(routes) = json.as_object() {
+                    return routes.contains_key(prefix);
+                }
+            }
+        }
+        false
     }
 
     /// Get neighbor summary for debugging
@@ -169,10 +192,16 @@ impl GobgpInstance {
         self.gobgp(&["neighbor"]).unwrap_or_default()
     }
 
-    /// Get routes for debugging
+    /// Get IPv6 routes for debugging
     #[allow(dead_code)]
     pub fn get_routes(&self) -> String {
         self.gobgp(&["global", "rib", "-a", "ipv6"]).unwrap_or_default()
+    }
+
+    /// Get IPv4 routes for debugging
+    #[allow(dead_code)]
+    pub fn get_routes_v4(&self) -> String {
+        self.gobgp(&["global", "rib", "-a", "ipv4"]).unwrap_or_default()
     }
 }
 

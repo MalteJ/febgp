@@ -14,7 +14,7 @@ pub struct Config {
     pub peers: Vec<PeerConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PeerConfig {
     /// Interface name for link-local peering (required)
     pub interface: String,

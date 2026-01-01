@@ -66,30 +66,30 @@ address = "fe80::1"
 ### Daemon
 
 ```sh
-febgp daemon --config <path> [--grpc-port <port>]
+febgp daemon [--config <path>] [--socket <path>]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--config`, `-c` | required | Path to configuration file |
-| `--grpc-port` | 50051 | gRPC API listen port |
+| `--config`, `-c` | /etc/febgp/config.toml | Path to configuration file |
+| `--socket` | /var/lib/febgp/grpc.sock | Unix socket path for gRPC API |
 
 ### Status
 
 ```sh
-febgp status [--address <addr>]
+febgp status [--socket <path>]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--address`, `-a` | 127.0.0.1:50051 | gRPC server address |
+| `--socket`, `-s` | /var/lib/febgp/grpc.sock | Unix socket path |
 
 ### Routes
 
 ```sh
-febgp routes [--address <addr>]
+febgp routes [--socket <path>]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--address`, `-a` | 127.0.0.1:50051 | gRPC server address |
+| `--socket`, `-s` | /var/lib/febgp/grpc.sock | Unix socket path |

@@ -31,12 +31,18 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
+/// BGP message header for synchronous I/O.
+///
+/// Used by the legacy `Session` struct and unit tests.
+/// The async `TcpTransport` handles header parsing internally.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Header {
     pub length: u16,
     pub msg_type: MessageType,
 }
 
+#[allow(dead_code)]
 impl Header {
     pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut marker = [0u8; 16];
@@ -68,7 +74,7 @@ impl Header {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OpenMessage {
     pub version: u8,
     pub asn: u16,
@@ -81,6 +87,8 @@ pub struct OpenMessage {
 pub enum Capability {
     MultiProtocol { afi: u16, safi: u8 },
     FourOctetAs { asn: u32 },
+    /// Unknown or unsupported capability (preserved for completeness).
+    Unknown { code: u8, data: Vec<u8> },
 }
 
 impl Capability {
@@ -96,6 +104,11 @@ impl Capability {
             Capability::FourOctetAs { asn } => {
                 let mut buf = vec![65, 4]; // Type 65, Length 4
                 buf.extend_from_slice(&asn.to_be_bytes());
+                buf
+            }
+            Capability::Unknown { code, data } => {
+                let mut buf = vec![*code, data.len() as u8];
+                buf.extend_from_slice(data);
                 buf
             }
         }
@@ -144,8 +157,9 @@ impl Capability {
                 Capability::FourOctetAs { asn }
             }
             _ => {
-                // Unknown capability, skip it
-                return Ok((Capability::FourOctetAs { asn: 0 }, 2 + cap_len));
+                // Unknown capability, preserve it
+                let cap_data = data[2..2 + cap_len].to_vec();
+                Capability::Unknown { code: cap_type, data: cap_data }
             }
         };
 
@@ -155,13 +169,14 @@ impl Capability {
 
 impl OpenMessage {
     pub fn new(asn: u32, hold_time: u16, router_id: Ipv4Addr) -> Self {
-        let mut capabilities = vec![
-            // IPv6 unicast
+        let capabilities = vec![
+            // IPv4 unicast (AFI=1, SAFI=1)
+            Capability::MultiProtocol { afi: 1, safi: 1 },
+            // IPv6 unicast (AFI=2, SAFI=1)
             Capability::MultiProtocol { afi: 2, safi: 1 },
+            // 4-octet AS support
+            Capability::FourOctetAs { asn },
         ];
-
-        // 4-octet AS support
-        capabilities.push(Capability::FourOctetAs { asn });
 
         Self {
             version: BGP_VERSION,
@@ -288,6 +303,11 @@ pub enum Message {
 }
 
 impl Message {
+    /// Read a BGP message from a synchronous reader.
+    ///
+    /// Used by the legacy `Session` struct and unit tests.
+    /// The async `TcpTransport` handles message reading internally.
+    #[allow(dead_code)]
     pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let header = Header::read(reader)?;
 
@@ -485,11 +505,14 @@ mod tests {
     fn test_capability_decode_unknown_type() {
         let data = vec![99, 2, 0x12, 0x34]; // Unknown capability type 99
         let (cap, len) = Capability::decode(&data).unwrap();
-        assert_eq!(len, 4); // Should skip the unknown capability
-        // Returns a placeholder FourOctetAs with asn=0
+        assert_eq!(len, 4);
+        // Returns Unknown capability with preserved data
         match cap {
-            Capability::FourOctetAs { asn } => assert_eq!(asn, 0),
-            _ => panic!("Expected placeholder FourOctetAs"),
+            Capability::Unknown { code, data } => {
+                assert_eq!(code, 99);
+                assert_eq!(data, vec![0x12, 0x34]);
+            }
+            _ => panic!("Expected Unknown capability"),
         }
     }
 
@@ -503,7 +526,8 @@ mod tests {
         assert_eq!(open.asn, 65001);
         assert_eq!(open.hold_time, 180);
         assert_eq!(open.router_id, Ipv4Addr::new(1, 2, 3, 4));
-        assert_eq!(open.capabilities.len(), 2); // MultiProtocol + FourOctetAs
+        // IPv4 unicast + IPv6 unicast + FourOctetAs
+        assert_eq!(open.capabilities.len(), 3);
     }
 
     #[test]

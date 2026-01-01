@@ -1,5 +1,5 @@
-pub mod server;
 pub mod client;
+pub mod server;
 
 // Include generated protobuf code
 pub mod proto {
@@ -9,10 +9,8 @@ pub mod proto {
 pub use proto::febgp_service_client::FebgpServiceClient;
 pub use proto::febgp_service_server::{FebgpService, FebgpServiceServer};
 
-/// Default gRPC port for FeBGP
-pub const DEFAULT_GRPC_PORT: u16 = 50051;
+/// Default configuration file path
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/febgp/config.toml";
 
-/// Default gRPC address
-pub fn default_grpc_addr() -> String {
-    format!("127.0.0.1:{}", DEFAULT_GRPC_PORT)
-}
+/// Default gRPC socket path
+pub const DEFAULT_SOCKET_PATH: &str = "/var/lib/febgp/grpc.sock";
