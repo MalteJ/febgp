@@ -1,6 +1,7 @@
 pub mod api;
 pub mod bgp;
 pub mod config;
+pub mod neighbor_discovery;
 pub mod netlink;
 pub mod rib;
 

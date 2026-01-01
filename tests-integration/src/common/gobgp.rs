@@ -7,10 +7,12 @@ use std::process::Child;
 use super::netns::NetNs;
 
 // Path to gobgp binaries (from workspace root tools/ directory)
+#[allow(dead_code)]
 const GOBGPD_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/gobgpd");
 const GOBGP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/gobgp");
 
 /// Configuration for a GoBGP instance
+#[allow(dead_code)]
 pub struct GobgpConfig {
     pub asn: u32,
     pub router_id: Ipv4Addr,
@@ -19,6 +21,7 @@ pub struct GobgpConfig {
 }
 
 /// A BGP neighbor using link-local address
+#[allow(dead_code)]
 pub struct GobgpNeighbor {
     pub address: String,       // Link-local address with interface (e.g., "fe80::1%eth0")
     pub local_address: String, // Our link-local address with interface
@@ -27,6 +30,7 @@ pub struct GobgpNeighbor {
 
 impl GobgpConfig {
     /// Generate the GoBGP TOML configuration
+    #[allow(dead_code)]
     pub fn generate(&self) -> String {
         let mut config = String::new();
 
@@ -69,6 +73,7 @@ pub struct GobgpInstance {
 
 impl GobgpInstance {
     /// Start GoBGP in the given namespace with the given config
+    #[allow(dead_code)]
     pub fn start(ns: &NetNs, config: &GobgpConfig, api_port: u16) -> io::Result<Self> {
         let config_dir = ns.run_dir_path();
         let config_content = config.generate();
@@ -196,6 +201,7 @@ impl GobgpInstance {
     }
 
     /// Get neighbor summary for debugging
+    #[allow(dead_code)]
     pub fn get_neighbor_summary(&self) -> String {
         self.gobgp(&["neighbor"]).unwrap_or_default()
     }
@@ -238,6 +244,7 @@ impl GobgpInstance {
 
 impl GobgpInstance {
     /// Stop the GoBGP instance explicitly (for testing withdrawal scenarios)
+    #[allow(dead_code)]
     pub fn stop(&mut self) {
         let _ = self.gobgpd.kill();
         let _ = self.gobgpd.wait();
@@ -252,6 +259,7 @@ impl Drop for GobgpInstance {
 }
 
 /// Get the link-local address of an interface in a namespace
+#[allow(dead_code)]
 pub fn get_link_local_address(ns: &NetNs, interface: &str) -> io::Result<String> {
     let output = std::process::Command::new("ip")
         .args([

@@ -71,11 +71,16 @@ const BGP_PORT: u16 = 179;
 /// Supports:
 /// - Plain IP addresses (e.g., "192.0.2.1", "2001:db8::1")
 /// - IPv6 with scope ID (e.g., "fe80::1%eth0")
-pub fn parse_peer_address(peer: &PeerConfig) -> Result<SocketAddr, String> {
+///
+/// Returns:
+/// - `Ok(Some(addr))` - explicit address configured
+/// - `Ok(None)` - no address, use neighbor discovery
+/// - `Err(e)` - invalid address format
+pub fn parse_peer_address(peer: &PeerConfig) -> Result<Option<SocketAddr>, String> {
     if let Some(addr_str) = &peer.address {
         // Explicit address provided
         if let Ok(addr) = addr_str.parse::<std::net::IpAddr>() {
-            return Ok(SocketAddr::new(addr, BGP_PORT));
+            return Ok(Some(SocketAddr::new(addr, BGP_PORT)));
         }
 
         // Try parsing as IPv6 with scope ID (fe80::1%eth0 format)
@@ -85,17 +90,16 @@ pub fn parse_peer_address(peer: &PeerConfig) -> Result<SocketAddr, String> {
                 .map_err(|e| format!("Invalid IPv6 address: {}", e))?;
             let scope_id = get_interface_index(scope_part)
                 .ok_or_else(|| format!("Unknown interface: {}", scope_part))?;
-            return Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+            return Ok(Some(SocketAddr::V6(std::net::SocketAddrV6::new(
                 ip, BGP_PORT, 0, scope_id,
-            )));
+            ))));
         }
 
         return Err(format!("Invalid address format: {}", addr_str));
     }
 
-    // No address specified - for now, require explicit address
-    // TODO: Implement neighbor discovery for link-local peering
-    Err("No peer address specified and neighbor discovery not yet implemented".to_string())
+    // No address specified - use neighbor discovery
+    Ok(None)
 }
 
 /// Get interface index by name.

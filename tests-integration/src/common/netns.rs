@@ -47,6 +47,7 @@ impl NetNs {
     }
 
     /// Spawn a long-running process in this namespace
+    #[allow(dead_code)]
     pub fn spawn(&self, cmd: &str, args: &[&str]) -> io::Result<Child> {
         Command::new("ip")
             .args(["netns", "exec", &self.name, cmd])

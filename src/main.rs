@@ -17,6 +17,7 @@ use febgp::api::server::{DaemonState, FebgpServiceImpl, NeighborState};
 use febgp::{FebgpServiceServer, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH};
 use febgp::bgp::{self, build_ipv4_update, build_ipv6_update, parse_update, FsmConfig, FsmState, SessionActor, SessionCommand, SessionEvent, TcpTransport};
 use febgp::config::{parse_peer_address, Config, PeerConfig};
+use febgp::neighbor_discovery::{NeighborDiscovery, NeighborEvent};
 use febgp::rib::{RibActor, RibCommand, RibHandle};
 
 /// Context for running a peer session.
@@ -140,42 +141,168 @@ async fn run_daemon_async(
     }
 
     // Track command senders for graceful shutdown and incoming connection routing
-    let mut session_senders: Vec<mpsc::Sender<SessionCommand>> = Vec::new();
+    let session_senders: Arc<RwLock<Vec<mpsc::Sender<SessionCommand>>>> =
+        Arc::new(RwLock::new(Vec::new()));
     // Map from peer address (without port) to session command sender
     let peer_addr_to_sender: Arc<RwLock<HashMap<String, mpsc::Sender<SessionCommand>>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
-    // Spawn BGP sessions for each peer
+    // Channel for neighbor discovery events
+    let (neighbor_tx, mut neighbor_rx) = mpsc::channel::<NeighborEvent>(32);
+
+    // Store peer configs for interfaces awaiting neighbor discovery
+    // Maps interface name to (peer_idx, peer_config)
+    let mut discovery_peers: HashMap<String, (usize, PeerConfig)> = HashMap::new();
+
+    // Spawn BGP sessions for peers with explicit addresses,
+    // start neighbor discovery for peers without addresses
     for (peer_idx, peer) in config.peers.iter().enumerate() {
-        let ctx = PeerSessionContext {
-            peer_idx,
-            peer: peer.clone(),
-            local_asn: config.asn,
-            router_id: config.router_id,
-            state: Arc::clone(&state),
-            prefixes: config.prefixes.clone(),
-            rib_handle: rib_handle.clone(),
-            hold_time: config.hold_time,
-            connect_retry_time: config.connect_retry_time,
-            ipv4_unicast: config.ipv4_unicast,
-            ipv6_unicast: config.ipv6_unicast,
-        };
+        match parse_peer_address(peer) {
+            Ok(Some(peer_addr)) => {
+                // Explicit address - start session immediately
+                let ctx = PeerSessionContext {
+                    peer_idx,
+                    peer: peer.clone(),
+                    local_asn: config.asn,
+                    router_id: config.router_id,
+                    state: Arc::clone(&state),
+                    prefixes: config.prefixes.clone(),
+                    rib_handle: rib_handle.clone(),
+                    hold_time: config.hold_time,
+                    connect_retry_time: config.connect_retry_time,
+                    ipv4_unicast: config.ipv4_unicast,
+                    ipv6_unicast: config.ipv6_unicast,
+                };
 
-        // Create command channel and keep sender for shutdown
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(16);
-        session_senders.push(cmd_tx.clone());
+                // Create command channel and keep sender for shutdown
+                let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(16);
+                session_senders.write().await.push(cmd_tx.clone());
 
-        // Register this peer's address for incoming connection routing
-        if let Ok(peer_addr) = parse_peer_address(peer) {
-            let addr_key = extract_ip_addr(&peer_addr);
-            let mut map = peer_addr_to_sender.write().await;
-            map.insert(addr_key, cmd_tx.clone());
+                // Register this peer's address for incoming connection routing
+                let addr_key = extract_ip_addr(&peer_addr);
+                peer_addr_to_sender.write().await.insert(addr_key, cmd_tx.clone());
+
+                tokio::spawn(async move {
+                    run_peer_session(ctx, cmd_tx, cmd_rx, Some(peer_addr)).await;
+                });
+            }
+            Ok(None) => {
+                // No address - use neighbor discovery
+                info!(
+                    interface = peer.interface,
+                    "Starting neighbor discovery on {}",
+                    peer.interface
+                );
+
+                // Store peer config for when neighbor is discovered
+                discovery_peers.insert(peer.interface.clone(), (peer_idx, peer.clone()));
+
+                // Start neighbor discovery for this interface
+                match NeighborDiscovery::new(&peer.interface, neighbor_tx.clone()) {
+                    Ok(nd) => {
+                        tokio::spawn(nd.run());
+                    }
+                    Err(e) => {
+                        error!(
+                            interface = peer.interface,
+                            error = %e,
+                            "Failed to start neighbor discovery on {}: {}",
+                            peer.interface,
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    interface = peer.interface,
+                    error = %e,
+                    "Invalid peer configuration for {}: {}",
+                    peer.interface,
+                    e
+                );
+            }
         }
-
-        tokio::spawn(async move {
-            run_peer_session(ctx, cmd_tx, cmd_rx).await;
-        });
     }
+
+    // Clone values needed for the neighbor handler task
+    let neighbor_state = Arc::clone(&state);
+    let neighbor_rib_handle = rib_handle.clone();
+    let neighbor_session_senders = Arc::clone(&session_senders);
+    let neighbor_peer_addr_to_sender = Arc::clone(&peer_addr_to_sender);
+    let neighbor_config_asn = config.asn;
+    let neighbor_config_router_id = config.router_id;
+    let neighbor_config_prefixes = config.prefixes.clone();
+    let neighbor_config_hold_time = config.hold_time;
+    let neighbor_config_connect_retry_time = config.connect_retry_time;
+    let neighbor_config_ipv4_unicast = config.ipv4_unicast;
+    let neighbor_config_ipv6_unicast = config.ipv6_unicast;
+
+    // Spawn task to handle discovered neighbors
+    tokio::spawn(async move {
+        while let Some(event) = neighbor_rx.recv().await {
+            match event {
+                NeighborEvent::Discovered { interface, interface_index, address } => {
+                    info!(
+                        interface = interface,
+                        neighbor = %address,
+                        "Neighbor discovered: {} on {}",
+                        address,
+                        interface
+                    );
+
+                    // Find the peer config for this interface
+                    if let Some((peer_idx, peer)) = discovery_peers.get(&interface) {
+                        let peer_idx = *peer_idx;
+                        let peer = peer.clone();
+
+                        // Create peer address with scope ID
+                        let peer_addr = SocketAddr::V6(std::net::SocketAddrV6::new(
+                            address,
+                            179, // BGP port
+                            0,
+                            interface_index,
+                        ));
+
+                        // Update neighbor state with discovered address
+                        {
+                            let mut s = neighbor_state.write().await;
+                            if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
+                                neighbor.address = format!("{}%{}", address, interface);
+                            }
+                        }
+
+                        let ctx = PeerSessionContext {
+                            peer_idx,
+                            peer,
+                            local_asn: neighbor_config_asn,
+                            router_id: neighbor_config_router_id,
+                            state: Arc::clone(&neighbor_state),
+                            prefixes: neighbor_config_prefixes.clone(),
+                            rib_handle: neighbor_rib_handle.clone(),
+                            hold_time: neighbor_config_hold_time,
+                            connect_retry_time: neighbor_config_connect_retry_time,
+                            ipv4_unicast: neighbor_config_ipv4_unicast,
+                            ipv6_unicast: neighbor_config_ipv6_unicast,
+                        };
+
+                        // Create command channel
+                        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(16);
+                        neighbor_session_senders.write().await.push(cmd_tx.clone());
+
+                        // Register for incoming connection routing
+                        let addr_key = extract_ip_addr(&peer_addr);
+                        neighbor_peer_addr_to_sender.write().await.insert(addr_key, cmd_tx.clone());
+
+                        // Spawn the BGP session
+                        tokio::spawn(async move {
+                            run_peer_session(ctx, cmd_tx, cmd_rx, Some(peer_addr)).await;
+                        });
+                    }
+                }
+            }
+        }
+    });
 
     // Start TCP listener for incoming BGP connections (non-fatal if it fails)
     let bgp_listener = TcpListener::bind("[::]:179").await.ok();
@@ -225,13 +352,14 @@ async fn run_daemon_async(
     info!(socket = socket_path, "gRPC server listening on {}", socket_path);
 
     // Set up signal handlers for graceful shutdown
-    let shutdown_senders = session_senders.clone();
+    let shutdown_senders = Arc::clone(&session_senders);
     let shutdown_handle = tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         info!("Received shutdown signal, stopping BGP sessions...");
 
         // Send Stop command to all sessions
-        for (idx, sender) in shutdown_senders.iter().enumerate() {
+        let senders = shutdown_senders.read().await;
+        for (idx, sender) in senders.iter().enumerate() {
             if let Err(e) = sender.send(SessionCommand::Stop).await {
                 error!(session = idx, error = %e, "Failed to send stop to session {}: {}", idx, e);
             }
@@ -381,10 +509,15 @@ async fn wait_for_shutdown_signal() {
 ///
 /// Takes externally created channels to allow the caller to keep a reference
 /// to the command sender for graceful shutdown.
+///
+/// The `peer_addr` parameter is optional - if None, it will be parsed from the
+/// peer configuration. This allows sessions to be started either from explicit
+/// config or from neighbor discovery.
 async fn run_peer_session(
     ctx: PeerSessionContext,
     cmd_tx: mpsc::Sender<SessionCommand>,
     cmd_rx: mpsc::Receiver<SessionCommand>,
+    peer_addr: Option<SocketAddr>,
 ) {
     let PeerSessionContext {
         peer_idx,
@@ -400,13 +533,20 @@ async fn run_peer_session(
         ipv6_unicast,
     } = ctx;
 
-    // Parse peer address
-    let peer_addr = match parse_peer_address(&peer) {
-        Ok(addr) => addr,
-        Err(e) => {
-            error!(interface = peer.interface, error = %e, "Failed to parse peer address for {}: {}", peer.interface, e);
-            return;
-        }
+    // Get peer address - either passed in or parsed from config
+    let peer_addr = match peer_addr {
+        Some(addr) => addr,
+        None => match parse_peer_address(&peer) {
+            Ok(Some(addr)) => addr,
+            Ok(None) => {
+                error!(interface = peer.interface, "No peer address available for {}", peer.interface);
+                return;
+            }
+            Err(e) => {
+                error!(interface = peer.interface, error = %e, "Failed to parse peer address for {}: {}", peer.interface, e);
+                return;
+            }
+        },
     };
 
     info!(peer = %peer_addr, interface = peer.interface, "Starting BGP session to {} via {}", peer_addr, peer.interface);

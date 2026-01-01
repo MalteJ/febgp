@@ -665,6 +665,7 @@ fn test_febgp_daemon_rib() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -850,6 +851,7 @@ fn test_febgp_two_gobgp_peers() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -1030,6 +1032,7 @@ fn test_febgp_aspath_selection() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -1184,6 +1187,7 @@ fn test_febgp_ecmp() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -1327,6 +1331,7 @@ fn test_febgp_ecmp_withdrawal() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -1482,6 +1487,7 @@ fn test_febgp_install_routes() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -1645,6 +1651,7 @@ fn test_febgp_install_routes_ecmp() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -1794,6 +1801,7 @@ fn test_febgp_install_routes_removal() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -1928,6 +1936,7 @@ fn test_febgp_install_routes_ecmp_withdrawal() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -2079,6 +2088,7 @@ fn test_febgp_install_routes_upgrade_to_ecmp() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -2220,6 +2230,7 @@ fn test_gobgp_receives_routes_from_febgp_daemon() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = ["10.99.0.0/24", "10.99.1.0/24", "2001:db8:99::/48"]
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
@@ -2352,6 +2363,7 @@ fn test_febgp_link_flap_route_recovery() {
             r#"asn = 65001
 router_id = "1.1.1.1"
 prefixes = []
+ipv4_unicast = true
 
 [[peer]]
 interface = "eth0"
