@@ -192,6 +192,29 @@ impl GobgpInstance {
         self.gobgp(&["neighbor"]).unwrap_or_default()
     }
 
+    /// Get detailed neighbor info for a specific AFI
+    #[allow(dead_code)]
+    pub fn get_neighbor_afi(&self, neighbor: &str, afi: &str) -> String {
+        self.gobgp(&["neighbor", neighbor, "-a", afi]).unwrap_or_default()
+    }
+
+    /// Get received route count for a neighbor on a specific AFI
+    #[allow(dead_code)]
+    pub fn get_neighbor_received_count(&self, afi: &str) -> Option<u64> {
+        if let Ok(output) = self.gobgp(&["neighbor", "-a", afi, "-j"]) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output) {
+                if let Some(neighbors) = json.as_array() {
+                    if let Some(first) = neighbors.first() {
+                        return first.get("state")
+                            .and_then(|s| s.get("adj_rib_in_count"))
+                            .and_then(|c| c.as_u64());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Get IPv6 routes for debugging
     #[allow(dead_code)]
     pub fn get_routes(&self) -> String {

@@ -27,6 +27,8 @@ pub enum SessionCommand {
     Start,
     /// Stop the BGP session gracefully.
     Stop,
+    /// Send an UPDATE message (body only, without BGP header).
+    SendUpdate(Vec<u8>),
 }
 
 /// Events emitted by the session actor.
@@ -161,6 +163,15 @@ impl<T: BgpTransport> SessionActor<T> {
                 self.running = false;
                 self.process_event(FsmEvent::Admin(AdminEvent::ManualStop))
                     .await;
+            }
+            SessionCommand::SendUpdate(body) => {
+                // Only send UPDATE if we're in Established state
+                if self.fsm.state() == FsmState::Established {
+                    let bytes = Self::build_update_message(&body);
+                    if let Err(e) = self.transport.send(&bytes).await {
+                        eprintln!("Failed to send UPDATE: {}", e);
+                    }
+                }
             }
         }
     }
@@ -375,6 +386,20 @@ impl<T: BgpTransport> SessionActor<T> {
         buf.push(err.code as u8);
         buf.push(err.subcode);
         buf.extend_from_slice(&err.data);
+        buf
+    }
+
+    /// Build an UPDATE message from body bytes.
+    fn build_update_message(body: &[u8]) -> Vec<u8> {
+        use crate::bgp::message::{BGP_HEADER_LEN, BGP_MARKER};
+
+        let total_len = (BGP_HEADER_LEN + body.len()) as u16;
+
+        let mut buf = Vec::with_capacity(total_len as usize);
+        buf.extend_from_slice(&BGP_MARKER);
+        buf.extend_from_slice(&total_len.to_be_bytes());
+        buf.push(2); // UPDATE message type
+        buf.extend_from_slice(body);
         buf
     }
 }

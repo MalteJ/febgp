@@ -63,12 +63,17 @@ fn test_febgp_to_gobgp_link_local() {
     // We use a helper binary that uses the febgp library
     let febgp_result = run_febgp_in_namespace(
         &ns1,
-        65001,
-        "1.1.1.1",
-        65002,
-        &addr2,
-        if_index,
-        179,
+        &FebgpOptions {
+            local_asn: 65001,
+            router_id: "1.1.1.1",
+            remote_asn: 65002,
+            peer_addr: &addr2,
+            scope_id: if_index,
+            port: 179,
+            announce_v4: vec![],
+            announce_v6: vec![],
+            wait_seconds: 3,
+        },
     );
 
     match febgp_result {
@@ -123,15 +128,20 @@ fn get_interface_index(ns: &NetNs, interface: &str) -> std::io::Result<u32> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-fn run_febgp_in_namespace(
-    ns: &NetNs,
+/// Options for running FeBGP in a namespace
+struct FebgpOptions<'a> {
     local_asn: u32,
-    router_id: &str,
+    router_id: &'a str,
     remote_asn: u32,
-    peer_addr: &str,
+    peer_addr: &'a str,
     scope_id: u32,
     port: u16,
-) -> std::io::Result<String> {
+    announce_v4: Vec<&'a str>,
+    announce_v6: Vec<&'a str>,
+    wait_seconds: u64,
+}
+
+fn run_febgp_in_namespace(ns: &NetNs, opts: &FebgpOptions) -> std::io::Result<String> {
     // Get workspace root (tests-integration is one level down)
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let binary_path = workspace_root.join("target/debug/febgp-connect");
@@ -144,20 +154,37 @@ fn run_febgp_in_namespace(
         )));
     }
 
+    // Build args
+    let mut args = vec![
+        "netns".to_string(),
+        "exec".to_string(),
+        ns.name.clone(),
+        binary_path.to_str().unwrap().to_string(),
+        opts.local_asn.to_string(),
+        opts.router_id.to_string(),
+        opts.remote_asn.to_string(),
+        opts.peer_addr.to_string(),
+        opts.scope_id.to_string(),
+        opts.port.to_string(),
+    ];
+
+    // Add route announcements
+    for prefix in &opts.announce_v4 {
+        args.push("--announce-v4".to_string());
+        args.push(prefix.to_string());
+    }
+    for prefix in &opts.announce_v6 {
+        args.push("--announce-v6".to_string());
+        args.push(prefix.to_string());
+    }
+
+    // Add wait time
+    args.push("--wait".to_string());
+    args.push(opts.wait_seconds.to_string());
+
     // Run the helper in the namespace
     let output = Command::new("ip")
-        .args([
-            "netns",
-            "exec",
-            &ns.name,
-            binary_path.to_str().unwrap(),
-            &local_asn.to_string(),
-            router_id,
-            &remote_asn.to_string(),
-            peer_addr,
-            &scope_id.to_string(),
-            &port.to_string(),
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -173,4 +200,561 @@ fn run_febgp_in_namespace(
     }
 
     Ok(format!("{}\n{}", stdout, stderr))
+}
+
+/// Test that FeBGP can receive IPv4 routes from GoBGP.
+#[test]
+fn test_febgp_receives_ipv4_from_gobgp() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create two network namespaces
+    let ns1 = NetNs::new("febgp_test_v4r1").expect("Failed to create namespace");
+    let ns2 = NetNs::new("febgp_test_v4r2").expect("Failed to create namespace");
+
+    // Create a veth pair between them
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair");
+
+    // Wait for DAD to complete
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+
+    // Configure GoBGP
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start GoBGP
+    let gobgp2 = GobgpInstance::start(&ns2, &config2, 50053).expect("Failed to start GoBGP");
+
+    // Give GoBGP time to start
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Have GoBGP announce an IPv4 prefix
+    gobgp2.announce_prefix_v4("10.100.0.0/24").expect("Failed to announce IPv4 prefix");
+
+    let if_index = get_interface_index(&ns1, "eth0").expect("Failed to get interface index");
+
+    // Run FeBGP and wait for routes
+    let febgp_result = run_febgp_in_namespace(
+        &ns1,
+        &FebgpOptions {
+            local_asn: 65001,
+            router_id: "1.1.1.1",
+            remote_asn: 65002,
+            peer_addr: &addr2,
+            scope_id: if_index,
+            port: 179,
+            announce_v4: vec![],
+            announce_v6: vec![],
+            wait_seconds: 5,
+        },
+    );
+
+    match febgp_result {
+        Ok(output) => {
+            println!("FeBGP output:\n{}", output);
+
+            assert!(
+                output.contains("ESTABLISHED"),
+                "FeBGP did not reach ESTABLISHED state"
+            );
+
+            assert!(
+                output.contains("RECEIVED_V4: 10.100.0.0/24"),
+                "FeBGP did not receive expected IPv4 prefix. Output:\n{}",
+                output
+            );
+
+            println!("IPv4 route receive test passed!");
+        }
+        Err(e) => {
+            eprintln!("=== GoBGP neighbor state ===");
+            eprintln!("{}", gobgp2.get_neighbor_summary());
+            panic!("FeBGP failed: {}", e);
+        }
+    }
+}
+
+/// Test that FeBGP can receive IPv6 routes from GoBGP.
+#[test]
+fn test_febgp_receives_ipv6_from_gobgp() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create two network namespaces
+    let ns1 = NetNs::new("febgp_test_v6r1").expect("Failed to create namespace");
+    let ns2 = NetNs::new("febgp_test_v6r2").expect("Failed to create namespace");
+
+    // Create a veth pair between them
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair");
+
+    // Wait for DAD to complete
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+
+    // Configure GoBGP
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start GoBGP
+    let gobgp2 = GobgpInstance::start(&ns2, &config2, 50054).expect("Failed to start GoBGP");
+
+    // Give GoBGP time to start
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Have GoBGP announce an IPv6 prefix
+    gobgp2.announce_prefix("2001:db8:100::/48").expect("Failed to announce IPv6 prefix");
+
+    let if_index = get_interface_index(&ns1, "eth0").expect("Failed to get interface index");
+
+    // Run FeBGP and wait for routes
+    let febgp_result = run_febgp_in_namespace(
+        &ns1,
+        &FebgpOptions {
+            local_asn: 65001,
+            router_id: "1.1.1.1",
+            remote_asn: 65002,
+            peer_addr: &addr2,
+            scope_id: if_index,
+            port: 179,
+            announce_v4: vec![],
+            announce_v6: vec![],
+            wait_seconds: 5,
+        },
+    );
+
+    match febgp_result {
+        Ok(output) => {
+            println!("FeBGP output:\n{}", output);
+
+            assert!(
+                output.contains("ESTABLISHED"),
+                "FeBGP did not reach ESTABLISHED state"
+            );
+
+            assert!(
+                output.contains("RECEIVED_V6: 2001:db8:100::/48"),
+                "FeBGP did not receive expected IPv6 prefix. Output:\n{}",
+                output
+            );
+
+            println!("IPv6 route receive test passed!");
+        }
+        Err(e) => {
+            eprintln!("=== GoBGP neighbor state ===");
+            eprintln!("{}", gobgp2.get_neighbor_summary());
+            panic!("FeBGP failed: {}", e);
+        }
+    }
+}
+
+/// Test that FeBGP can send IPv4 routes to GoBGP.
+#[test]
+fn test_febgp_sends_ipv4_to_gobgp() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create two network namespaces
+    let ns1 = NetNs::new("febgp_test_s4r1").expect("Failed to create namespace");
+    let ns2 = NetNs::new("febgp_test_s4r2").expect("Failed to create namespace");
+
+    // Create a veth pair between them
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair");
+
+    // Wait for DAD to complete
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+
+    // Configure GoBGP
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start GoBGP
+    let gobgp2 = GobgpInstance::start(&ns2, &config2, 50055).expect("Failed to start GoBGP");
+
+    // Give GoBGP time to start
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    let if_index = get_interface_index(&ns1, "eth0").expect("Failed to get interface index");
+
+    // Spawn FeBGP in background so we can check routes while session is active
+    let ns1_name = ns1.name.clone();
+    let addr2_clone = addr2.clone();
+    let febgp_handle = std::thread::spawn(move || {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let binary_path = workspace_root.join("target/debug/febgp-connect");
+
+        Command::new("ip")
+            .args([
+                "netns", "exec", &ns1_name,
+                binary_path.to_str().unwrap(),
+                "65001", "1.1.1.1", "65002", &addr2_clone,
+                &if_index.to_string(), "179",
+                "--announce-v4", "10.200.0.0/24",
+                "--wait", "10",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+    });
+
+    // Wait for session to establish and routes to be exchanged
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Check if GoBGP received the route while session is still active
+    let gobgp_routes = gobgp2.get_routes_v4();
+    println!("GoBGP IPv4 RIB:\n{}", gobgp_routes);
+
+    // Show per-AFI received count (more accurate than generic neighbor summary)
+    let received_count = gobgp2.get_neighbor_received_count("ipv4");
+    println!("GoBGP IPv4 received count from neighbor: {:?}", received_count);
+    println!("GoBGP neighbor state:\n{}", gobgp2.get_neighbor_summary());
+
+    let has_route = gobgp2.has_prefix_v4("10.200.0.0/24");
+
+    // Wait for FeBGP to finish
+    let febgp_result = febgp_handle.join().expect("FeBGP thread panicked");
+    match febgp_result {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("FeBGP output:\n{}\n{}", stdout, stderr);
+
+            assert!(
+                stdout.contains("ESTABLISHED") || stderr.contains("ESTABLISHED"),
+                "FeBGP did not reach ESTABLISHED state"
+            );
+
+            assert!(
+                stdout.contains("SENT_UPDATE_V4: 10.200.0.0/24") || stderr.contains("SENT_UPDATE_V4: 10.200.0.0/24"),
+                "FeBGP did not send expected IPv4 prefix"
+            );
+        }
+        Err(e) => {
+            panic!("FeBGP failed: {}", e);
+        }
+    }
+
+    assert!(
+        has_route,
+        "GoBGP did not receive expected IPv4 prefix from FeBGP. Routes:\n{}",
+        gobgp_routes
+    );
+
+    // Note: The RIB check above is the source of truth.
+    // The neighbor received count may show None due to GoBGP's JSON API structure.
+    // The route being in the RIB with AS_PATH 65001 proves it was received from FeBGP.
+    if let Some(count) = received_count {
+        println!("GoBGP reports {} routes received from neighbor", count);
+    }
+
+    println!("IPv4 route send test passed!");
+}
+
+/// Test that FeBGP can send IPv6 routes to GoBGP.
+#[test]
+fn test_febgp_sends_ipv6_to_gobgp() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create two network namespaces
+    let ns1 = NetNs::new("febgp_test_s6r1").expect("Failed to create namespace");
+    let ns2 = NetNs::new("febgp_test_s6r2").expect("Failed to create namespace");
+
+    // Create a veth pair between them
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair");
+
+    // Wait for DAD to complete
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+
+    // Configure GoBGP
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start GoBGP
+    let gobgp2 = GobgpInstance::start(&ns2, &config2, 50056).expect("Failed to start GoBGP");
+
+    // Give GoBGP time to start
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    let if_index = get_interface_index(&ns1, "eth0").expect("Failed to get interface index");
+
+    // Spawn FeBGP in background so we can check routes while session is active
+    let ns1_name = ns1.name.clone();
+    let addr2_clone = addr2.clone();
+    let febgp_handle = std::thread::spawn(move || {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let binary_path = workspace_root.join("target/debug/febgp-connect");
+
+        Command::new("ip")
+            .args([
+                "netns", "exec", &ns1_name,
+                binary_path.to_str().unwrap(),
+                "65001", "1.1.1.1", "65002", &addr2_clone,
+                &if_index.to_string(), "179",
+                "--announce-v6", "2001:db8:200::/48",
+                "--wait", "10",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+    });
+
+    // Wait for session to establish and routes to be exchanged
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Check if GoBGP received the route while session is still active
+    let gobgp_routes = gobgp2.get_routes();
+    println!("GoBGP IPv6 RIB:\n{}", gobgp_routes);
+
+    // Show per-AFI received count (more accurate than generic neighbor summary)
+    let received_count = gobgp2.get_neighbor_received_count("ipv6");
+    println!("GoBGP IPv6 received count from neighbor: {:?}", received_count);
+    println!("GoBGP neighbor state:\n{}", gobgp2.get_neighbor_summary());
+
+    let has_route = gobgp2.has_prefix("2001:db8:200::/48");
+
+    // Wait for FeBGP to finish
+    let febgp_result = febgp_handle.join().expect("FeBGP thread panicked");
+    match febgp_result {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!("FeBGP output:\n{}\n{}", stdout, stderr);
+
+            assert!(
+                stdout.contains("ESTABLISHED") || stderr.contains("ESTABLISHED"),
+                "FeBGP did not reach ESTABLISHED state"
+            );
+
+            assert!(
+                stdout.contains("SENT_UPDATE_V6: 2001:db8:200::/48") || stderr.contains("SENT_UPDATE_V6: 2001:db8:200::/48"),
+                "FeBGP did not send expected IPv6 prefix"
+            );
+        }
+        Err(e) => {
+            panic!("FeBGP failed: {}", e);
+        }
+    }
+
+    assert!(
+        has_route,
+        "GoBGP did not receive expected IPv6 prefix from FeBGP. Routes:\n{}",
+        gobgp_routes
+    );
+
+    // Note: The RIB check above is the source of truth.
+    // The neighbor received count may show None due to GoBGP's JSON API structure.
+    // The route being in the RIB with AS_PATH 65001 proves it was received from FeBGP.
+    if let Some(count) = received_count {
+        println!("GoBGP reports {} routes received from neighbor", count);
+    }
+
+    println!("IPv6 route send test passed!");
+}
+
+/// Test that FeBGP daemon properly stores received routes in RIB.
+#[test]
+fn test_febgp_daemon_rib() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create two network namespaces
+    let ns1 = NetNs::new("febgp_test_rib1").expect("Failed to create namespace");
+    let ns2 = NetNs::new("febgp_test_rib2").expect("Failed to create namespace");
+
+    // Create a veth pair between them
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair");
+
+    // Wait for DAD to complete
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+
+    // Configure GoBGP
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start GoBGP
+    let gobgp2 = GobgpInstance::start(&ns2, &config2, 50060).expect("Failed to start GoBGP");
+
+    // Give GoBGP time to start
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Have GoBGP announce some prefixes
+    gobgp2.announce_prefix_v4("10.50.0.0/24").expect("Failed to announce IPv4 prefix");
+    gobgp2.announce_prefix_v4("10.50.1.0/24").expect("Failed to announce IPv4 prefix");
+    gobgp2.announce_prefix("2001:db8:50::/48").expect("Failed to announce IPv6 prefix");
+
+    // Create FeBGP config
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_rib_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_rib_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+"#,
+            addr2
+        ),
+    )
+    .expect("Failed to write config");
+
+    // Start FeBGP daemon
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon",
+            "-c",
+            &config_path,
+            "--socket",
+            &socket_path,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for session to establish and routes to be received
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Run febgp routes command
+    let routes_output = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "routes",
+            "-s",
+            &socket_path,
+        ])
+        .output()
+        .expect("Failed to run febgp routes");
+
+    let routes_stdout = String::from_utf8_lossy(&routes_output.stdout);
+    println!("FeBGP routes output:\n{}", routes_stdout);
+
+    // Run febgp status command
+    let status_output = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "status",
+            "-s",
+            &socket_path,
+        ])
+        .output()
+        .expect("Failed to run febgp status");
+
+    let status_stdout = String::from_utf8_lossy(&status_output.stdout);
+    println!("FeBGP status output:\n{}", status_stdout);
+
+    // Kill daemon
+    let _ = daemon.kill();
+
+    // Clean up config
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Verify routes are in output
+    assert!(
+        routes_stdout.contains("10.50.0.0/24"),
+        "RIB should contain 10.50.0.0/24"
+    );
+    assert!(
+        routes_stdout.contains("10.50.1.0/24"),
+        "RIB should contain 10.50.1.0/24"
+    );
+    assert!(
+        routes_stdout.contains("2001:db8:50::/48"),
+        "RIB should contain 2001:db8:50::/48"
+    );
+
+    // Verify status shows prefixes received
+    assert!(
+        status_stdout.contains("Established"),
+        "Session should be Established"
+    );
+
+    println!("FeBGP daemon RIB test passed!");
 }

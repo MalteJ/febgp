@@ -14,9 +14,9 @@ mod api;
 mod bgp;
 mod config;
 
-use api::server::{DaemonState, FebgpServiceImpl, NeighborState};
+use api::server::{DaemonState, FebgpServiceImpl, NeighborState, RouteEntry};
 use api::{FebgpServiceServer, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH};
-use bgp::{FsmConfig, FsmState, SessionActor, SessionCommand, SessionEvent, TcpTransport};
+use bgp::{parse_update, FsmConfig, FsmState, SessionActor, SessionCommand, SessionEvent, TcpTransport};
 use config::{Config, PeerConfig};
 
 #[derive(Parser)]
@@ -296,9 +296,18 @@ async fn run_peer_session(
                 update_peer_state(&state, peer_idx, bgp::SessionState::Idle).await;
                 established_at = None;
             }
-            SessionEvent::UpdateReceived { .. } => {
-                // TODO: Process UPDATE messages and update RIB
-                increment_prefixes_received(&state, peer_idx).await;
+            SessionEvent::UpdateReceived(data) => {
+                // Parse UPDATE and add routes to RIB
+                let routes = parse_update(&data);
+                let route_count = routes.len();
+
+                for route in routes {
+                    add_route(&state, peer_idx, route).await;
+                }
+
+                if route_count > 0 {
+                    println!("Received {} route(s) from peer {}", route_count, peer_idx);
+                }
             }
         }
 
@@ -372,10 +381,43 @@ async fn update_uptime(state: &Arc<RwLock<DaemonState>>, peer_idx: usize, uptime
     }
 }
 
-/// Increment prefixes received counter.
-async fn increment_prefixes_received(state: &Arc<RwLock<DaemonState>>, peer_idx: usize) {
+/// Add a route to the RIB.
+async fn add_route(
+    state: &Arc<RwLock<DaemonState>>,
+    peer_idx: usize,
+    route: bgp::ParsedRoute,
+) {
     let mut s = state.write().await;
-    if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
-        neighbor.prefixes_received += 1;
+
+    // Format AS path as string
+    let as_path_str = route
+        .as_path
+        .iter()
+        .map(|asn| asn.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Check if route already exists (update it) or add new
+    let existing = s.routes.iter_mut().find(|r| r.prefix == route.prefix);
+
+    if let Some(existing_route) = existing {
+        // Update existing route
+        existing_route.next_hop = route.next_hop.to_string();
+        existing_route.as_path = as_path_str;
+        existing_route.origin = route.origin.to_string();
+    } else {
+        // Add new route
+        s.routes.push(RouteEntry {
+            prefix: route.prefix,
+            next_hop: route.next_hop.to_string(),
+            as_path: as_path_str,
+            origin: route.origin.to_string(),
+            best: true, // For now, mark all routes as best
+        });
+
+        // Update prefixes received counter
+        if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
+            neighbor.prefixes_received += 1;
+        }
     }
 }
