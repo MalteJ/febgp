@@ -12,6 +12,22 @@ pub struct Config {
     pub prefixes: Vec<String>,
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
+    /// BGP hold time in seconds (keepalive = hold_time / 3).
+    /// Default: 9 seconds (keepalive = 3 seconds).
+    #[serde(default = "default_hold_time")]
+    pub hold_time: u16,
+    /// Connect retry timer in seconds.
+    /// Default: 30 seconds.
+    #[serde(default = "default_connect_retry_time")]
+    pub connect_retry_time: u64,
+}
+
+fn default_hold_time() -> u16 {
+    9
+}
+
+fn default_connect_retry_time() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,7 +43,11 @@ pub struct PeerConfig {
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let content = fs::read_to_string(path)?;
-        toml::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        Self::parse(&content)
+    }
+
+    pub fn parse(content: &str) -> io::Result<Self> {
+        toml::from_str(content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -69,4 +89,93 @@ pub fn parse_peer_address(peer: &PeerConfig) -> Result<SocketAddr, String> {
 /// Get interface index by name.
 pub fn get_interface_index(name: &str) -> Option<u32> {
     nix::net::if_::if_nametoindex(name).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_default_timers() {
+        let config: Config = Config::parse(
+            r#"
+            asn = 65000
+            router_id = "1.2.3.4"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.hold_time, 9);
+        assert_eq!(config.connect_retry_time, 30);
+    }
+
+    #[test]
+    fn test_config_custom_timers() {
+        let config: Config = Config::parse(
+            r#"
+            asn = 65000
+            router_id = "1.2.3.4"
+            hold_time = 90
+            connect_retry_time = 120
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.hold_time, 90);
+        assert_eq!(config.connect_retry_time, 120);
+    }
+
+    #[test]
+    fn test_config_partial_timer_override() {
+        let config: Config = Config::parse(
+            r#"
+            asn = 65000
+            router_id = "1.2.3.4"
+            hold_time = 15
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.hold_time, 15);
+        assert_eq!(config.connect_retry_time, 30); // Default
+    }
+
+    #[test]
+    fn test_config_timers_3_9() {
+        // Test the "timers 3 9" equivalent config
+        let config: Config = Config::parse(
+            r#"
+            asn = 65000
+            router_id = "1.2.3.4"
+            hold_time = 9
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.hold_time, 9);
+        // Keepalive is hold_time / 3
+        assert_eq!(config.hold_time / 3, 3);
+    }
+
+    #[test]
+    fn test_config_with_peers_and_timers() {
+        let config: Config = Config::parse(
+            r#"
+            asn = 65000
+            router_id = "1.2.3.4"
+            hold_time = 30
+            connect_retry_time = 60
+
+            [[peer]]
+            interface = "eth0"
+            address = "192.168.1.1"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.hold_time, 30);
+        assert_eq!(config.connect_retry_time, 60);
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].interface, "eth0");
+    }
 }

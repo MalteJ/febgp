@@ -26,6 +26,8 @@ struct PeerSessionContext {
     state: Arc<RwLock<DaemonState>>,
     prefixes: Vec<String>,
     rib_handle: RibHandle,
+    hold_time: u16,
+    connect_retry_time: u64,
 }
 
 #[derive(Parser)]
@@ -89,6 +91,8 @@ async fn run_daemon_async(
     println!("  Router ID: {}", config.router_id);
     println!("  Prefixes: {:?}", config.prefixes);
     println!("  Peers: {}", config.peers.len());
+    println!("  Timers: hold={} keepalive={} connect_retry={}",
+             config.hold_time, config.hold_time / 3, config.connect_retry_time);
     if install_routes {
         println!("  Route installation: enabled");
     }
@@ -139,6 +143,8 @@ async fn run_daemon_async(
             state: Arc::clone(&state),
             prefixes: config.prefixes.clone(),
             rib_handle: rib_handle.clone(),
+            hold_time: config.hold_time,
+            connect_retry_time: config.connect_retry_time,
         };
 
         // Create command channel and keep sender for shutdown
@@ -329,6 +335,8 @@ async fn run_peer_session(
         state,
         prefixes,
         rib_handle,
+        hold_time,
+        connect_retry_time,
     } = ctx;
 
     // Parse peer address
@@ -346,9 +354,9 @@ async fn run_peer_session(
     let fsm_config = FsmConfig {
         local_asn,
         router_id,
-        hold_time: 90,
+        hold_time,
         peer_asn: peer.remote_asn.unwrap_or(0), // 0 = accept any (BGP unnumbered)
-        connect_retry_time: std::time::Duration::from_secs(30),
+        connect_retry_time: std::time::Duration::from_secs(connect_retry_time),
     };
 
     // Create transport
