@@ -103,7 +103,7 @@ fn parse_ipv4_nlri(data: &[u8]) -> Vec<String> {
         let prefix_len = data[pos] as usize;
         pos += 1;
 
-        let bytes_needed = (prefix_len + 7) / 8;
+        let bytes_needed = prefix_len.div_ceil(8);
         if pos + bytes_needed > data.len() {
             break;
         }
@@ -133,7 +133,7 @@ fn parse_ipv6_nlri(data: &[u8]) -> Vec<String> {
         let prefix_len = data[pos] as usize;
         pos += 1;
 
-        let bytes_needed = (prefix_len + 7) / 8;
+        let bytes_needed = prefix_len.div_ceil(8);
         if pos + bytes_needed > data.len() {
             break;
         }
@@ -212,7 +212,7 @@ fn parse_update(data: &[u8]) -> (Vec<String>, Vec<String>) {
             let safi = attr_data[2];
             let next_hop_len = attr_data[3] as usize;
 
-            if 4 + next_hop_len + 1 <= attr_len {
+            if 4 + next_hop_len < attr_len {
                 // Skip next hop and reserved byte
                 let nlri_start = 4 + next_hop_len + 1;
                 let nlri_data = &attr_data[nlri_start..];
@@ -407,20 +407,20 @@ fn build_ipv4_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
     update.extend_from_slice(&0u16.to_be_bytes());
 
     // Build path attributes
-    let mut path_attrs = Vec::new();
-
-    // ORIGIN (type 1) - IGP
-    path_attrs.push(0x40); // Transitive
-    path_attrs.push(1);    // ORIGIN
-    path_attrs.push(1);    // Length
-    path_attrs.push(0);    // IGP
-
-    // AS_PATH (type 2) - AS_SEQUENCE with our ASN
-    path_attrs.push(0x40); // Transitive
-    path_attrs.push(2);    // AS_PATH
-    path_attrs.push(6);    // Length (1 + 1 + 4)
-    path_attrs.push(2);    // AS_SEQUENCE
-    path_attrs.push(1);    // 1 ASN
+    #[rustfmt::skip]
+    let mut path_attrs = vec![
+        // ORIGIN (type 1) - IGP
+        0x40, // Transitive
+        1,    // ORIGIN
+        1,    // Length
+        0,    // IGP
+        // AS_PATH (type 2) - AS_SEQUENCE with our ASN
+        0x40, // Transitive
+        2,    // AS_PATH
+        6,    // Length (1 + 1 + 4)
+        2,    // AS_SEQUENCE
+        1,    // 1 ASN
+    ];
     path_attrs.extend_from_slice(&local_asn.to_be_bytes());
 
     // MP_REACH_NLRI (type 14) for IPv4
@@ -438,7 +438,7 @@ fn build_ipv4_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
 
     // NLRI
     mp_reach.push(prefix_len);
-    let bytes_needed = ((prefix_len + 7) / 8) as usize;
+    let bytes_needed = prefix_len.div_ceil(8) as usize;
     mp_reach.extend_from_slice(&addr.octets()[..bytes_needed]);
 
     // MP_REACH_NLRI attribute (optional, non-transitive per RFC 4760)
@@ -479,20 +479,20 @@ fn build_ipv6_update(prefix_str: &str, local_asn: u32, _router_id: Ipv4Addr) -> 
     update.extend_from_slice(&0u16.to_be_bytes());
 
     // Build path attributes
-    let mut path_attrs = Vec::new();
-
-    // ORIGIN (type 1) - IGP
-    path_attrs.push(0x40); // Transitive
-    path_attrs.push(1);    // ORIGIN
-    path_attrs.push(1);    // Length
-    path_attrs.push(0);    // IGP
-
-    // AS_PATH (type 2) - AS_SEQUENCE with our ASN
-    path_attrs.push(0x40); // Transitive
-    path_attrs.push(2);    // AS_PATH
-    path_attrs.push(6);    // Length
-    path_attrs.push(2);    // AS_SEQUENCE
-    path_attrs.push(1);    // 1 ASN
+    #[rustfmt::skip]
+    let mut path_attrs = vec![
+        // ORIGIN (type 1) - IGP
+        0x40, // Transitive
+        1,    // ORIGIN
+        1,    // Length
+        0,    // IGP
+        // AS_PATH (type 2) - AS_SEQUENCE with our ASN
+        0x40, // Transitive
+        2,    // AS_PATH
+        6,    // Length
+        2,    // AS_SEQUENCE
+        1,    // 1 ASN
+    ];
     path_attrs.extend_from_slice(&local_asn.to_be_bytes());
 
     // MP_REACH_NLRI (type 14) for IPv6
@@ -510,7 +510,7 @@ fn build_ipv6_update(prefix_str: &str, local_asn: u32, _router_id: Ipv4Addr) -> 
 
     // NLRI
     mp_reach.push(prefix_len);
-    let bytes_needed = ((prefix_len + 7) / 8) as usize;
+    let bytes_needed = prefix_len.div_ceil(8) as usize;
     mp_reach.extend_from_slice(&addr.octets()[..bytes_needed]);
 
     // MP_REACH_NLRI attribute (optional, non-transitive per RFC 4760)

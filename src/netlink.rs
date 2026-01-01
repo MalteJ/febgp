@@ -20,7 +20,8 @@
 use std::net::IpAddr;
 
 use futures::TryStreamExt;
-use netlink_packet_route::route::RouteProtocol;
+use netlink_packet_route::route::{RouteMessage, RouteProtocol};
+use netlink_packet_route::AddressFamily;
 use rtnetlink::Handle;
 
 /// Protocol ID for BGP routes (186 = BGP per IANA)
@@ -161,7 +162,9 @@ async fn remove_route_v4(
     _gateway: std::net::Ipv4Addr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Find and delete matching routes
-    let mut routes = handle.route().get(rtnetlink::IpVersion::V4).execute();
+    let mut filter = RouteMessage::default();
+    filter.header.address_family = AddressFamily::Inet;
+    let mut routes = handle.route().get(filter).execute();
 
     while let Some(route) = routes.try_next().await? {
         // Check if this route matches our prefix
@@ -185,7 +188,9 @@ async fn remove_route_v6(
     _gateway: std::net::Ipv6Addr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Find and delete matching routes
-    let mut routes = handle.route().get(rtnetlink::IpVersion::V6).execute();
+    let mut filter = RouteMessage::default();
+    filter.header.address_family = AddressFamily::Inet6;
+    let mut routes = handle.route().get(filter).execute();
 
     while let Some(route) = routes.try_next().await? {
         // Check if this route matches our prefix
@@ -339,7 +344,9 @@ async fn remove_route_v4_any(
     prefix_len: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Find and delete all matching BGP routes
-    let mut routes = handle.route().get(rtnetlink::IpVersion::V4).execute();
+    let mut filter = RouteMessage::default();
+    filter.header.address_family = AddressFamily::Inet;
+    let mut routes = handle.route().get(filter).execute();
 
     while let Some(route) = routes.try_next().await? {
         // Check if this route matches our prefix

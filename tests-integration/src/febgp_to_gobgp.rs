@@ -1,3 +1,6 @@
+// Test daemons are spawned and later killed via daemon.kill() - not zombie processes
+#![allow(clippy::zombie_processes)]
+
 mod common;
 
 use std::net::Ipv4Addr;

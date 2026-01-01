@@ -11,10 +11,13 @@ endif
 GOBGP_URL := https://github.com/osrg/gobgp/releases/download/v$(GOBGP_VERSION)/gobgp_$(GOBGP_VERSION)_linux_$(GOBGP_ARCH).tar.gz
 TOOLS_DIR := tools
 
-.PHONY: test test-integration clean build tools
+.PHONY: test test-integration clean build tools clippy
 
 build:
 	cargo build --workspace
+
+clippy:
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # Download gobgp binaries
 tools: $(TOOLS_DIR)/gobgpd
