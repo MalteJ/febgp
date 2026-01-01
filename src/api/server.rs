@@ -5,14 +5,14 @@ use tonic::{Request, Response, Status};
 use super::proto::{Empty, Neighbor, Route, RoutesResponse, StatusResponse};
 use super::FebgpService;
 use crate::bgp::SessionState;
-use crate::rib::Rib;
+use crate::rib::RibHandle;
 
 /// Shared daemon state accessible by gRPC handlers
 pub struct DaemonState {
     pub asn: u32,
     pub router_id: String,
     pub neighbors: Vec<NeighborState>,
-    pub rib: Rib,
+    pub rib_handle: RibHandle,
 }
 
 pub struct NeighborState {
@@ -26,26 +26,13 @@ pub struct NeighborState {
 }
 
 impl DaemonState {
-    pub fn new(asn: u32, router_id: String) -> Self {
+    pub fn new(asn: u32, router_id: String, rib_handle: RibHandle) -> Self {
         Self {
             asn,
             router_id,
             neighbors: Vec::new(),
-            rib: Rib::new(),
+            rib_handle,
         }
-    }
-
-    /// Create a new DaemonState with route installation enabled.
-    ///
-    /// This establishes a persistent netlink connection that will be reused
-    /// for all route install/remove operations.
-    pub fn with_netlink(asn: u32, router_id: String) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Self {
-            asn,
-            router_id,
-            neighbors: Vec::new(),
-            rib: Rib::with_netlink()?,
-        })
     }
 }
 
@@ -92,11 +79,15 @@ impl FebgpService for FebgpServiceImpl {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<RoutesResponse>, Status> {
-        let state = self.state.read().await;
+        // Clone the handle so we can drop the lock before awaiting
+        let rib_handle = {
+            let state = self.state.read().await;
+            state.rib_handle.clone()
+        };
 
-        let routes = state
-            .rib
-            .routes()
+        let routes = rib_handle
+            .get_routes()
+            .await
             .iter()
             .map(|r| Route {
                 prefix: r.prefix.clone(),

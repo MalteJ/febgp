@@ -5,6 +5,8 @@
 //! - Best path selection (shortest AS path, ECMP for equal paths)
 //! - Kernel route installation via netlink
 
+use tokio::sync::{mpsc, oneshot};
+
 use crate::bgp::ParsedRoute;
 use crate::netlink::NetlinkHandle;
 
@@ -18,6 +20,36 @@ pub struct RouteEntry {
     pub origin: String,
     pub peer_idx: usize,
     pub best: bool,
+}
+
+/// Commands sent to the RibActor.
+pub enum RibCommand {
+    /// Add a single route from a peer session.
+    AddRoute {
+        peer_idx: usize,
+        route: ParsedRoute,
+        interface: String,
+    },
+    /// Add multiple routes in a batch (from a single UPDATE message).
+    AddRoutes {
+        peer_idx: usize,
+        routes: Vec<ParsedRoute>,
+        interface: String,
+    },
+    /// Remove all routes from a peer (session went down).
+    RemovePeerRoutes {
+        peer_idx: usize,
+        response: oneshot::Sender<usize>,
+    },
+    /// Get all routes (for gRPC get_routes).
+    GetRoutes {
+        response: oneshot::Sender<Vec<RouteEntry>>,
+    },
+    /// Get route count from a specific peer.
+    GetPeerStats {
+        peer_idx: usize,
+        response: oneshot::Sender<usize>,
+    },
 }
 
 /// The Routing Information Base.
@@ -273,6 +305,165 @@ fn recalculate_best_paths(routes: &mut [RouteEntry], prefix: &str) {
             if route.prefix == prefix {
                 route.best = route.as_path_len == min_len;
             }
+        }
+    }
+}
+
+/// Actor that owns and manages the RIB.
+///
+/// The RibActor runs in its own Tokio task and processes commands
+/// sent via an mpsc channel. This eliminates lock contention between
+/// peer sessions and gRPC handlers.
+pub struct RibActor {
+    rib: Rib,
+    command_rx: mpsc::Receiver<RibCommand>,
+}
+
+impl RibActor {
+    /// Create a new RibActor.
+    ///
+    /// If `install_routes` is true, routes will be installed into the
+    /// Linux kernel via netlink.
+    pub fn new(
+        command_rx: mpsc::Receiver<RibCommand>,
+        install_routes: bool,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let rib = if install_routes {
+            Rib::with_netlink()?
+        } else {
+            Rib::new()
+        };
+
+        Ok(Self { rib, command_rx })
+    }
+
+    /// Run the actor event loop.
+    ///
+    /// This method consumes the actor and runs until the command channel
+    /// is closed (all senders dropped).
+    pub async fn run(mut self) {
+        while let Some(cmd) = self.command_rx.recv().await {
+            match cmd {
+                RibCommand::AddRoute {
+                    peer_idx,
+                    route,
+                    interface,
+                } => {
+                    self.rib.add_route(peer_idx, route, &interface).await;
+                }
+                RibCommand::AddRoutes {
+                    peer_idx,
+                    routes,
+                    interface,
+                } => {
+                    for route in routes {
+                        self.rib.add_route(peer_idx, route, &interface).await;
+                    }
+                }
+                RibCommand::RemovePeerRoutes { peer_idx, response } => {
+                    let count = self.rib.remove_peer_routes(peer_idx).await;
+                    let _ = response.send(count);
+                }
+                RibCommand::GetRoutes { response } => {
+                    let routes = self.rib.routes().to_vec();
+                    let _ = response.send(routes);
+                }
+                RibCommand::GetPeerStats { peer_idx, response } => {
+                    let count = self.rib.count_routes_from_peer(peer_idx);
+                    let _ = response.send(count);
+                }
+            }
+        }
+    }
+}
+
+/// Handle for sending commands to the RibActor.
+///
+/// This is a lightweight, cloneable handle that can be shared across
+/// multiple peer sessions and the gRPC service.
+#[derive(Clone)]
+pub struct RibHandle {
+    sender: mpsc::Sender<RibCommand>,
+}
+
+impl RibHandle {
+    /// Create a new RibHandle from an mpsc sender.
+    pub fn new(sender: mpsc::Sender<RibCommand>) -> Self {
+        Self { sender }
+    }
+
+    /// Add a single route (fire-and-forget).
+    pub async fn add_route(&self, peer_idx: usize, route: ParsedRoute, interface: String) {
+        let _ = self
+            .sender
+            .send(RibCommand::AddRoute {
+                peer_idx,
+                route,
+                interface,
+            })
+            .await;
+    }
+
+    /// Add multiple routes in a batch (fire-and-forget).
+    pub async fn add_routes(&self, peer_idx: usize, routes: Vec<ParsedRoute>, interface: String) {
+        let _ = self
+            .sender
+            .send(RibCommand::AddRoutes {
+                peer_idx,
+                routes,
+                interface,
+            })
+            .await;
+    }
+
+    /// Remove all routes from a peer, returns count.
+    pub async fn remove_peer_routes(&self, peer_idx: usize) -> usize {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RibCommand::RemovePeerRoutes {
+                peer_idx,
+                response: tx,
+            })
+            .await
+            .is_ok()
+        {
+            rx.await.unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Get all routes (cloned).
+    pub async fn get_routes(&self) -> Vec<RouteEntry> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RibCommand::GetRoutes { response: tx })
+            .await
+            .is_ok()
+        {
+            rx.await.unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get route count for a specific peer.
+    pub async fn get_peer_stats(&self, peer_idx: usize) -> usize {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RibCommand::GetPeerStats {
+                peer_idx,
+                response: tx,
+            })
+            .await
+            .is_ok()
+        {
+            rx.await.unwrap_or(0)
+        } else {
+            0
         }
     }
 }

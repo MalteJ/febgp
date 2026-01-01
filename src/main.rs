@@ -15,6 +15,7 @@ use febgp::api::server::{DaemonState, FebgpServiceImpl, NeighborState};
 use febgp::{FebgpServiceServer, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH};
 use febgp::bgp::{self, build_ipv4_update, build_ipv6_update, parse_update, FsmConfig, FsmState, SessionActor, SessionCommand, SessionEvent, TcpTransport};
 use febgp::config::{parse_peer_address, Config, PeerConfig};
+use febgp::rib::{RibActor, RibCommand, RibHandle};
 
 /// Context for running a peer session.
 struct PeerSessionContext {
@@ -24,6 +25,7 @@ struct PeerSessionContext {
     router_id: Ipv4Addr,
     state: Arc<RwLock<DaemonState>>,
     prefixes: Vec<String>,
+    rib_handle: RibHandle,
 }
 
 #[derive(Parser)]
@@ -91,18 +93,23 @@ async fn run_daemon_async(
         println!("  Route installation: enabled");
     }
 
-    // Create shared state (with netlink handle if route installation is enabled)
-    let state = if install_routes {
-        Arc::new(RwLock::new(
-            DaemonState::with_netlink(config.asn, config.router_id.to_string())
-                .map_err(|e| format!("Failed to create netlink connection: {}", e))?,
-        ))
-    } else {
-        Arc::new(RwLock::new(DaemonState::new(
-            config.asn,
-            config.router_id.to_string(),
-        )))
-    };
+    // Create RibActor with command channel
+    let (rib_tx, rib_rx) = mpsc::channel::<RibCommand>(256);
+    let rib_handle = RibHandle::new(rib_tx);
+
+    let rib_actor = RibActor::new(rib_rx, install_routes)
+        .map_err(|e| format!("Failed to create RibActor: {}", e))?;
+
+    tokio::spawn(async move {
+        rib_actor.run().await;
+    });
+
+    // Create shared state
+    let state = Arc::new(RwLock::new(DaemonState::new(
+        config.asn,
+        config.router_id.to_string(),
+        rib_handle.clone(),
+    )));
 
     // Initialize neighbor states
     {
@@ -131,6 +138,7 @@ async fn run_daemon_async(
             router_id: config.router_id,
             state: Arc::clone(&state),
             prefixes: config.prefixes.clone(),
+            rib_handle: rib_handle.clone(),
         };
 
         // Create command channel and keep sender for shutdown
@@ -320,6 +328,7 @@ async fn run_peer_session(
         router_id,
         state,
         prefixes,
+        rib_handle,
     } = ctx;
 
     // Parse peer address
@@ -405,16 +414,20 @@ async fn run_peer_session(
             SessionEvent::SessionDown { reason } => {
                 println!("Session to {} went down: {}", peer_addr, reason);
                 update_peer_state(&state, peer_idx, bgp::SessionState::Idle).await;
-                // Remove all routes from this peer
+
+                // Remove all routes from this peer via RibActor (no write lock needed for RIB)
+                let removed = rib_handle.remove_peer_routes(peer_idx).await;
+
+                // Update neighbor state
                 {
                     let mut s = state.write().await;
-                    let removed = s.rib.remove_peer_routes(peer_idx).await;
                     if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
                         neighbor.prefixes_received = 0;
                     }
-                    if removed > 0 {
-                        println!("Removed {} route(s) from peer {}", removed, peer_idx);
-                    }
+                }
+
+                if removed > 0 {
+                    println!("Removed {} route(s) from peer {}", removed, peer_idx);
                 }
                 established_at = None;
             }
@@ -432,17 +445,15 @@ async fn run_peer_session(
                         .unwrap_or_default()
                 };
 
-                for route in routes {
-                    let mut s = state.write().await;
-                    s.rib.add_route(peer_idx, route, &interface).await;
-                }
+                // Send routes to RibActor (no write lock needed)
+                rib_handle.add_routes(peer_idx, routes, interface).await;
 
-                // Update prefix count
+                // Update prefix count from RibActor
+                let count = rib_handle.get_peer_stats(peer_idx).await;
                 {
                     let mut s = state.write().await;
-                    let count = s.rib.count_routes_from_peer(peer_idx) as u64;
                     if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
-                        neighbor.prefixes_received = count;
+                        neighbor.prefixes_received = count as u64;
                     }
                 }
 
