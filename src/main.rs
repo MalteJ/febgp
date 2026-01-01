@@ -17,7 +17,7 @@ use febgp::api::server::{DaemonState, FebgpServiceImpl, NeighborState};
 use febgp::{FebgpServiceServer, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH};
 use febgp::bgp::{self, build_ipv4_update, build_ipv6_update, parse_update, FsmConfig, FsmState, SessionActor, SessionCommand, SessionEvent, TcpTransport};
 use febgp::config::{parse_peer_address, Config, PeerConfig};
-use febgp::neighbor_discovery::{NeighborDiscovery, NeighborEvent};
+use febgp::neighbor_discovery::{get_interface_link_local, NeighborDiscovery, NeighborEvent};
 use febgp::rib::{RibActor, RibCommand, RibHandle};
 
 /// Context for running a peer session.
@@ -619,14 +619,28 @@ async fn run_peer_session(
                     peer_addr, peer_asn, peer_router_id
                 );
 
+                // Get our link-local address for the interface to use as next-hop
+                let local_link_local = match get_interface_link_local(&peer.interface) {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        error!(
+                            interface = peer.interface,
+                            error = %e,
+                            "Failed to get link-local address for {}: {}",
+                            peer.interface, e
+                        );
+                        continue;
+                    }
+                };
+
                 // Announce configured prefixes
                 for prefix in &prefixes {
                     let update_body = if prefix.contains(':') {
                         // IPv6 prefix
-                        build_ipv6_update(prefix, local_asn)
+                        build_ipv6_update(prefix, local_asn, local_link_local)
                     } else {
-                        // IPv4 prefix
-                        build_ipv4_update(prefix, local_asn)
+                        // IPv4 prefix (RFC 5549: IPv4 NLRI with IPv6 next-hop)
+                        build_ipv4_update(prefix, local_asn, local_link_local)
                     };
 
                     if let Some(body) = update_body {

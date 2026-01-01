@@ -75,6 +75,7 @@ fn test_febgp_to_gobgp_link_local() {
             port: 179,
             announce_v4: vec![],
             announce_v6: vec![],
+            local_addr: None,
             wait_seconds: 3,
         },
     );
@@ -141,6 +142,7 @@ struct FebgpOptions<'a> {
     port: u16,
     announce_v4: Vec<&'a str>,
     announce_v6: Vec<&'a str>,
+    local_addr: Option<&'a str>,
     wait_seconds: u64,
 }
 
@@ -170,6 +172,12 @@ fn run_febgp_in_namespace(ns: &NetNs, opts: &FebgpOptions) -> std::io::Result<St
         opts.scope_id.to_string(),
         opts.port.to_string(),
     ];
+
+    // Add local address for next-hop (required when announcing routes)
+    if let Some(local_addr) = opts.local_addr {
+        args.push("--local-addr".to_string());
+        args.push(local_addr.to_string());
+    }
 
     // Add route announcements
     for prefix in &opts.announce_v4 {
@@ -262,6 +270,7 @@ fn test_febgp_receives_ipv4_from_gobgp() {
             port: 179,
             announce_v4: vec![],
             announce_v6: vec![],
+            local_addr: None,
             wait_seconds: 5,
         },
     );
@@ -348,6 +357,7 @@ fn test_febgp_receives_ipv6_from_gobgp() {
             port: 179,
             announce_v4: vec![],
             announce_v6: vec![],
+            local_addr: None,
             wait_seconds: 5,
         },
     );
@@ -421,6 +431,7 @@ fn test_febgp_sends_ipv4_to_gobgp() {
 
     // Spawn FeBGP in background so we can check routes while session is active
     let ns1_name = ns1.name.clone();
+    let addr1_clone = addr1.clone();
     let addr2_clone = addr2.clone();
     let febgp_handle = std::thread::spawn(move || {
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -432,6 +443,7 @@ fn test_febgp_sends_ipv4_to_gobgp() {
                 binary_path.to_str().unwrap(),
                 "65001", "1.1.1.1", "65002", &addr2_clone,
                 &if_index.to_string(), "179",
+                "--local-addr", &addr1_clone,
                 "--announce-v4", "10.200.0.0/24",
                 "--wait", "10",
             ])
@@ -537,6 +549,7 @@ fn test_febgp_sends_ipv6_to_gobgp() {
 
     // Spawn FeBGP in background so we can check routes while session is active
     let ns1_name = ns1.name.clone();
+    let addr1_clone = addr1.clone();
     let addr2_clone = addr2.clone();
     let febgp_handle = std::thread::spawn(move || {
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -548,6 +561,7 @@ fn test_febgp_sends_ipv6_to_gobgp() {
                 binary_path.to_str().unwrap(),
                 "65001", "1.1.1.1", "65002", &addr2_clone,
                 &if_index.to_string(), "179",
+                "--local-addr", &addr1_clone,
                 "--announce-v6", "2001:db8:200::/48",
                 "--wait", "10",
             ])

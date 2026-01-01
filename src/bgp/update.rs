@@ -308,9 +308,12 @@ fn parse_ipv6_nlri(data: &[u8]) -> Vec<String> {
     prefixes
 }
 
-/// Build a BGP UPDATE message body for an IPv4 prefix using MP_REACH_NLRI.
+/// Build a BGP UPDATE message body for an IPv4 prefix using MP_REACH_NLRI (RFC 5549).
 /// Returns the UPDATE body (not including BGP header).
-pub fn build_ipv4_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
+///
+/// The `next_hop` should be the link-local IPv6 address of the interface used for this BGP session.
+/// This enables "BGP unnumbered" / RFC 5549 where IPv4 routes are advertised with IPv6 next-hops.
+pub fn build_ipv4_update(prefix_str: &str, local_asn: u32, next_hop: Ipv6Addr) -> Option<Vec<u8>> {
     let parts: Vec<&str> = prefix_str.split('/').collect();
     if parts.len() != 2 {
         return None;
@@ -341,15 +344,14 @@ pub fn build_ipv4_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
     ];
     path_attrs.extend_from_slice(&local_asn.to_be_bytes());
 
-    // MP_REACH_NLRI (type 14) for IPv4
+    // MP_REACH_NLRI (type 14) for IPv4 with IPv6 next-hop (RFC 5549)
     let mut mp_reach = Vec::new();
     mp_reach.extend_from_slice(&1u16.to_be_bytes()); // AFI = 1 (IPv4)
     mp_reach.push(1); // SAFI = 1 (unicast)
 
-    // Next hop - 4 bytes for IPv4
-    mp_reach.push(4); // Next hop length
-    // Use a placeholder next-hop (0.0.0.0) - the peer should determine the correct next-hop
-    mp_reach.extend_from_slice(&[0, 0, 0, 0]);
+    // Next hop - 16 bytes for IPv6 (RFC 5549: IPv4 NLRI with IPv6 next-hop)
+    mp_reach.push(16); // Next hop length
+    mp_reach.extend_from_slice(&next_hop.octets());
 
     mp_reach.push(0); // Reserved
 
@@ -373,7 +375,9 @@ pub fn build_ipv4_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
 
 /// Build a BGP UPDATE message body for an IPv6 prefix using MP_REACH_NLRI.
 /// Returns the UPDATE body (not including BGP header).
-pub fn build_ipv6_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
+///
+/// The `next_hop` should be the link-local address of the interface used for this BGP session.
+pub fn build_ipv6_update(prefix_str: &str, local_asn: u32, next_hop: Ipv6Addr) -> Option<Vec<u8>> {
     let parts: Vec<&str> = prefix_str.split('/').collect();
     if parts.len() != 2 {
         return None;
@@ -409,8 +413,7 @@ pub fn build_ipv6_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
     mp_reach.extend_from_slice(&2u16.to_be_bytes()); // AFI = 2 (IPv6)
     mp_reach.push(1); // SAFI = 1 (unicast)
 
-    // Next hop - use link-local placeholder (fe80::1)
-    let next_hop: Ipv6Addr = "fe80::1".parse().unwrap();
+    // Next hop - use the interface's link-local address
     mp_reach.push(16); // Next hop length (16 bytes for single IPv6)
     mp_reach.extend_from_slice(&next_hop.octets());
 

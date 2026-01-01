@@ -5,6 +5,7 @@
 //! Options:
 //!   --announce-v4 <prefix>   Announce an IPv4 prefix (e.g., "10.0.0.0/24")
 //!   --announce-v6 <prefix>   Announce an IPv6 prefix (e.g., "2001:db8::/32")
+//!   --local-addr <addr>      Local link-local address to use as next-hop (required for announcing)
 //!   --wait <seconds>         Wait time after establishment (default: 3)
 
 use std::env;
@@ -26,6 +27,7 @@ struct Args {
     port: u16,
     announce_v4: Vec<String>,
     announce_v6: Vec<String>,
+    local_addr: Option<Ipv6Addr>,
     wait_seconds: u64,
 }
 
@@ -48,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
 
     let mut announce_v4 = Vec::new();
     let mut announce_v6 = Vec::new();
+    let mut local_addr: Option<Ipv6Addr> = None;
     let mut wait_seconds = 3u64;
 
     let mut i = 7;
@@ -66,6 +69,13 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--announce-v6 requires a prefix".to_string());
                 }
                 announce_v6.push(args[i].clone());
+            }
+            "--local-addr" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--local-addr requires an address".to_string());
+                }
+                local_addr = Some(args[i].parse().map_err(|e| format!("Invalid local_addr: {}", e))?);
             }
             "--wait" => {
                 i += 1;
@@ -90,6 +100,7 @@ fn parse_args() -> Result<Args, String> {
         port,
         announce_v4,
         announce_v6,
+        local_addr,
         wait_seconds,
     })
 }
@@ -336,8 +347,16 @@ async fn main() -> ExitCode {
 
     // Send UPDATE messages if we have routes to announce
     if !args.announce_v4.is_empty() || !args.announce_v6.is_empty() {
+        let next_hop = match args.local_addr {
+            Some(addr) => addr,
+            None => {
+                eprintln!("Error: --local-addr is required when announcing prefixes");
+                return ExitCode::FAILURE;
+            }
+        };
+
         for prefix in &args.announce_v4 {
-            if let Some(update) = build_ipv4_update(prefix, args.local_asn) {
+            if let Some(update) = build_ipv4_update(prefix, args.local_asn, next_hop) {
                 if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(update)).await {
                     eprintln!("Failed to send IPv4 UPDATE: {}", e);
                 }
@@ -345,7 +364,7 @@ async fn main() -> ExitCode {
             }
         }
         for prefix in &args.announce_v6 {
-            if let Some(update) = build_ipv6_update(prefix, args.local_asn, args.router_id) {
+            if let Some(update) = build_ipv6_update(prefix, args.local_asn, next_hop) {
                 if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(update)).await {
                     eprintln!("Failed to send IPv6 UPDATE: {}", e);
                 }
@@ -392,9 +411,9 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Build a BGP UPDATE message for an IPv4 prefix using MP_REACH_NLRI
-/// (This is more compatible when the session uses link-local addresses)
-fn build_ipv4_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
+/// Build a BGP UPDATE message for an IPv4 prefix using MP_REACH_NLRI (RFC 5549)
+/// Uses the local link-local IPv6 address as the next-hop for BGP unnumbered.
+fn build_ipv4_update(prefix_str: &str, local_asn: u32, next_hop: Ipv6Addr) -> Option<Vec<u8>> {
     let parts: Vec<&str> = prefix_str.split('/').collect();
     if parts.len() != 2 {
         return None;
@@ -425,16 +444,14 @@ fn build_ipv4_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
     ];
     path_attrs.extend_from_slice(&local_asn.to_be_bytes());
 
-    // MP_REACH_NLRI (type 14) for IPv4
-    // Using MP_REACH_NLRI is more compatible when using link-local sessions
+    // MP_REACH_NLRI (type 14) for IPv4 with IPv6 next-hop (RFC 5549)
     let mut mp_reach = Vec::new();
     mp_reach.extend_from_slice(&1u16.to_be_bytes()); // AFI = 1 (IPv4)
     mp_reach.push(1); // SAFI = 1 (unicast)
 
-    // Next hop - 4 bytes for IPv4
-    mp_reach.push(4); // Next hop length
-    // Use a placeholder next-hop (10.0.0.1) - GoBGP should rewrite this
-    mp_reach.extend_from_slice(&[10, 0, 0, 1]);
+    // Next hop - 16 bytes for IPv6 (RFC 5549: IPv4 NLRI with IPv6 next-hop)
+    mp_reach.push(16); // Next hop length
+    mp_reach.extend_from_slice(&next_hop.octets());
 
     mp_reach.push(0); // Reserved
 
@@ -466,7 +483,7 @@ fn build_ipv4_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
 }
 
 /// Build a BGP UPDATE message for an IPv6 prefix using MP_REACH_NLRI
-fn build_ipv6_update(prefix_str: &str, local_asn: u32, _router_id: Ipv4Addr) -> Option<Vec<u8>> {
+fn build_ipv6_update(prefix_str: &str, local_asn: u32, next_hop: Ipv6Addr) -> Option<Vec<u8>> {
     let parts: Vec<&str> = prefix_str.split('/').collect();
     if parts.len() != 2 {
         return None;
@@ -502,9 +519,7 @@ fn build_ipv6_update(prefix_str: &str, local_asn: u32, _router_id: Ipv4Addr) -> 
     mp_reach.extend_from_slice(&2u16.to_be_bytes()); // AFI = 2 (IPv6)
     mp_reach.push(1); // SAFI = 1 (unicast)
 
-    // Next hop - use a link-local address (fe80::1)
-    // For link-local BGP sessions, the next-hop should be link-local
-    let next_hop: Ipv6Addr = "fe80::1".parse().unwrap();
+    // Next hop - use the interface's link-local address
     mp_reach.push(16); // Next hop length (16 bytes for single IPv6)
     mp_reach.extend_from_slice(&next_hop.octets());
 
