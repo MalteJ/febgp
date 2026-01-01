@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::os::unix::io::AsRawFd;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -93,6 +94,41 @@ impl TcpTransport {
     pub fn with_read_timeout(mut self, timeout: Duration) -> Self {
         self.read_timeout = timeout;
         self
+    }
+
+    /// Set TTL/hop limit on a socket.
+    /// Uses IP_TTL for IPv4 and IPV6_UNICAST_HOPS for IPv6.
+    fn set_ttl(socket: &tokio::net::TcpSocket, ttl: u32) -> io::Result<()> {
+        use libc::{setsockopt, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_HOPS, IP_TTL};
+
+        let fd = socket.as_raw_fd();
+        let ttl_val = ttl as libc::c_int;
+
+        // Try IPv6 first, then IPv4
+        // For dual-stack sockets, we set both
+        unsafe {
+            let ret = setsockopt(
+                fd,
+                IPPROTO_IPV6,
+                IPV6_UNICAST_HOPS,
+                &ttl_val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if ret != 0 {
+                // If IPv6 fails, try IPv4
+                let ret = setsockopt(
+                    fd,
+                    IPPROTO_IP,
+                    IP_TTL,
+                    &ttl_val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read exactly `n` bytes from the stream.
@@ -187,17 +223,21 @@ impl BgpTransport for TcpTransport {
 
         // Connect with timeout
         let stream = match timeout(self.connect_timeout, async {
+            let socket = match self.peer_addr {
+                SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+                SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+            };
+
+            // Set TTL/hop limit to 1 for GTSM (Generalized TTL Security Mechanism)
+            // This is required for eBGP sessions, especially BGP unnumbered
+            Self::set_ttl(&socket, 1)?;
+
             if let Some(local_addr) = self.local_addr {
                 // Bind to local address first (for link-local)
-                let socket = match self.peer_addr {
-                    SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-                    SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-                };
                 socket.bind(local_addr)?;
-                socket.connect(self.peer_addr).await
-            } else {
-                TcpStream::connect(self.peer_addr).await
             }
+
+            socket.connect(self.peer_addr).await
         })
         .await
         {
