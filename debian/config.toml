@@ -1,0 +1,23 @@
+# FeBGP configuration
+# See https://github.com/maltej/febgp/blob/main/docs/configuration.md
+
+# Local AS number (required)
+asn = 65000
+
+# BGP Router ID in IPv4 format (required)
+router_id = "0.0.0.0"
+
+# IPv6 prefixes to announce (optional)
+prefixes = []
+
+# BGP timers (optional)
+# hold_time = 9              # hold time in seconds (default: 9)
+# connect_retry_time = 30    # connect retry in seconds (default: 30)
+
+# Peer configuration
+# Uncomment and configure for each BGP neighbor
+
+# [[peer]]
+# interface = "eth0"
+# # remote_asn = 65001       # optional: learned from OPEN if omitted
+# # address = "fe80::1"      # optional: uses neighbor discovery if omitted

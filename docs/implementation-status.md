@@ -52,10 +52,12 @@ This document tracks the implementation status of the BGP Finite State Machine p
 | Timer | Status | Default | Notes |
 |-------|--------|---------|-------|
 | ConnectRetryTimer | Implemented | 30s | Time between connection attempts |
-| HoldTimer | Implemented | 90s (negotiated) | Dead peer detection |
+| HoldTimer | Implemented | 9s (negotiated) | Dead peer detection |
 | KeepaliveTimer | Implemented | hold_time/3 | KEEPALIVE interval |
 | DelayOpenTimer | Not implemented | - | For delayed OPEN feature |
 | IdleHoldTimer | Not implemented | - | For peer oscillation damping |
+
+Both `hold_time` and `connect_retry_time` are configurable in the TOML config file.
 
 ### OPEN Message Validation (RFC 4271 Section 6.2)
 

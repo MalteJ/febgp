@@ -9,6 +9,10 @@ asn = 65001
 router_id = "1.1.1.1"
 prefixes = ["2001:db8::/32", "2001:db8:1::/48"]
 
+# Optional: customize timers (defaults shown)
+hold_time = 9              # hold time in seconds
+connect_retry_time = 30    # connect retry in seconds
+
 [[peer]]
 interface = "eth0"
 
@@ -20,11 +24,13 @@ address = "fe80::1"
 
 ## Global Settings
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `asn` | integer | yes | Local Autonomous System Number (1-4294967295) |
-| `router_id` | string | yes | BGP Router ID in IPv4 address format |
-| `prefixes` | array | no | IPv6 prefixes to announce |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `asn` | integer | yes | - | Local Autonomous System Number (1-4294967295) |
+| `router_id` | string | yes | - | BGP Router ID in IPv4 address format |
+| `prefixes` | array | no | `[]` | IPv6 prefixes to announce |
+| `hold_time` | integer | no | `9` | BGP hold time in seconds (keepalive = hold_time / 3) |
+| `connect_retry_time` | integer | no | `30` | Connect retry timer in seconds |
 
 ## Peer Configuration
 
@@ -66,13 +72,14 @@ address = "fe80::1"
 ### Daemon
 
 ```sh
-febgp daemon [--config <path>] [--socket <path>]
+febgp daemon [--config <path>] [--socket <path>] [--install-routes]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--config`, `-c` | /etc/febgp/config.toml | Path to configuration file |
 | `--socket` | /var/lib/febgp/grpc.sock | Unix socket path for gRPC API |
+| `--install-routes` | disabled | Install received routes into Linux routing table via netlink |
 
 ### Status
 

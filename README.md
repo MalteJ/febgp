@@ -9,6 +9,7 @@ A BGP daemon written in Rust, designed for BGP unnumbered deployments.
 - Auto-detection of remote ASN from peer's OPEN message
 - 4-octet ASN capability (RFC 6793)
 - Multiprotocol extensions for IPv6 (RFC 4760)
+- FIB installation via netlink
 - gRPC API for status and route queries
 - TOML configuration
 
@@ -28,6 +29,9 @@ febgp daemon
 
 # Or with custom paths
 febgp daemon --config /path/to/config.toml --socket /path/to/grpc.sock
+
+# Install received routes into Linux routing table
+febgp daemon --install-routes
 ```
 
 ### Query status
@@ -50,6 +54,10 @@ Create a `config.toml`:
 asn = 65001
 router_id = "1.1.1.1"
 prefixes = ["2001:db8::/32"]
+
+# Optional: customize timers
+hold_time = 9           # default: 9s (keepalive = 3s)
+connect_retry_time = 30 # default: 30s
 
 # BGP unnumbered - just specify the interface
 [[peer]]

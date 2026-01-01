@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# Create working directory
+mkdir -p /var/lib/febgp
+chmod 755 /var/lib/febgp
+
+# Reload systemd to pick up the new service
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+#DEBHELPER#

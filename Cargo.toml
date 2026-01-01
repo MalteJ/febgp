@@ -3,6 +3,26 @@ name = "febgp"
 version = "0.1.0"
 edition = "2021"
 description = "FeBGP - A BGP daemon in Rust"
+license = "Apache-2.0"
+repository = "https://github.com/maltej/febgp"
+readme = "README.md"
+
+[package.metadata.deb]
+maintainer = "FeBGP Maintainers"
+copyright = "2024 FeBGP Authors"
+extended-description = """\
+A BGP daemon written in Rust, designed for BGP unnumbered deployments.
+Supports BGP-4, 4-octet ASN, IPv6, and FIB installation via netlink."""
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/febgp", "usr/sbin/", "755"],
+    ["debian/config.toml", "etc/febgp/config.toml", "644"],
+    ["debian/febgp.service", "lib/systemd/system/febgp.service", "644"],
+]
+conf-files = ["/etc/febgp/config.toml"]
+maintainer-scripts = "debian/"
+systemd-units = { enable = false }
 
 [[bin]]
 name = "febgp"
