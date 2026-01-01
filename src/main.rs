@@ -361,6 +361,7 @@ async fn run_daemon_async(
 
     // Set up signal handlers for graceful shutdown
     let shutdown_senders = Arc::clone(&session_senders);
+    let shutdown_rib_handle = rib_handle.clone();
     let shutdown_handle = tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         info!("Received shutdown signal, stopping BGP sessions...");
@@ -378,6 +379,15 @@ async fn run_daemon_async(
 
         // Give sessions time to send NOTIFICATION and close cleanly
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Remove installed routes from kernel (if route installation was enabled)
+        if install_routes {
+            let removed = shutdown_rib_handle.remove_all_routes().await;
+            if removed > 0 {
+                info!(routes_removed = removed, "Cleaned up {} kernel route(s)", removed);
+            }
+        }
+
         info!("Shutdown complete");
     });
 

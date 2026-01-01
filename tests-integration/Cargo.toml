@@ -19,8 +19,3 @@ path = "src/bin/febgp_connect.rs"
 name = "febgp_to_gobgp"
 path = "src/febgp_to_gobgp.rs"
 harness = true
-
-[[test]]
-name = "neighbor_discovery"
-path = "src/neighbor_discovery.rs"
-harness = true

@@ -50,6 +50,10 @@ pub enum RibCommand {
         peer_idx: usize,
         response: oneshot::Sender<usize>,
     },
+    /// Remove all routes from kernel (for shutdown cleanup).
+    RemoveAllRoutes {
+        response: oneshot::Sender<usize>,
+    },
 }
 
 /// The Routing Information Base.
@@ -280,6 +284,24 @@ impl Rib {
 
         removed_count
     }
+
+    /// Remove all installed BGP routes from the kernel.
+    ///
+    /// This is called during daemon shutdown to clean up routes.
+    /// Queries the kernel directly for all routes with RTPROT_BGP protocol
+    /// and removes them - more robust than iterating through the RIB.
+    /// Returns the number of routes removed.
+    pub async fn remove_all_routes(&mut self) -> usize {
+        if let Some(ref netlink) = self.netlink {
+            let removed = netlink.remove_all_bgp_routes().await;
+            if removed > 0 {
+                tracing::info!(routes_removed = removed, "Removed {} BGP route(s) from kernel during shutdown", removed);
+            }
+            removed
+        } else {
+            0
+        }
+    }
 }
 
 /// Format next-hop with interface suffix for link-local IPv6 addresses.
@@ -372,6 +394,10 @@ impl RibActor {
                     let count = self.rib.count_routes_from_peer(peer_idx);
                     let _ = response.send(count);
                 }
+                RibCommand::RemoveAllRoutes { response } => {
+                    let count = self.rib.remove_all_routes().await;
+                    let _ = response.send(count);
+                }
             }
         }
     }
@@ -458,6 +484,21 @@ impl RibHandle {
                 peer_idx,
                 response: tx,
             })
+            .await
+            .is_ok()
+        {
+            rx.await.unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Remove all routes from kernel (for shutdown cleanup).
+    pub async fn remove_all_routes(&self) -> usize {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RibCommand::RemoveAllRoutes { response: tx })
             .await
             .is_ok()
         {

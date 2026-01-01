@@ -80,6 +80,22 @@ impl NetlinkHandle {
         Ok(())
     }
 
+    /// Remove all BGP routes from the kernel routing table.
+    ///
+    /// This queries the kernel directly for all routes with RTPROT_BGP protocol
+    /// and removes them. Used for cleanup on daemon shutdown.
+    pub async fn remove_all_bgp_routes(&self) -> usize {
+        let mut removed = 0;
+
+        // Remove IPv4 BGP routes
+        removed += remove_all_bgp_routes_v4(&self.handle).await;
+
+        // Remove IPv6 BGP routes
+        removed += remove_all_bgp_routes_v6(&self.handle).await;
+
+        removed
+    }
+
     /// Remove a route from the Linux routing table.
     pub async fn remove_route(&self, prefix: &str, next_hop: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (dest, prefix_len) = parse_prefix(prefix)?;
@@ -393,4 +409,58 @@ async fn remove_route_v4_any(
     }
 
     Ok(())
+}
+
+/// Remove all IPv4 BGP routes from the kernel.
+async fn remove_all_bgp_routes_v4(handle: &Handle) -> usize {
+    let mut filter = RouteMessage::default();
+    filter.header.address_family = AddressFamily::Inet;
+
+    let routes: Vec<RouteMessage> = match handle.route().get(filter).execute().try_collect().await {
+        Ok(routes) => routes,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to enumerate IPv4 routes for cleanup");
+            return 0;
+        }
+    };
+
+    let mut removed = 0;
+    for route in routes {
+        if route.header.protocol == RTPROT_BGP {
+            if let Err(e) = handle.route().del(route).execute().await {
+                tracing::warn!(error = %e, "Failed to remove IPv4 BGP route during shutdown");
+            } else {
+                removed += 1;
+            }
+        }
+    }
+
+    removed
+}
+
+/// Remove all IPv6 BGP routes from the kernel.
+async fn remove_all_bgp_routes_v6(handle: &Handle) -> usize {
+    let mut filter = RouteMessage::default();
+    filter.header.address_family = AddressFamily::Inet6;
+
+    let routes: Vec<RouteMessage> = match handle.route().get(filter).execute().try_collect().await {
+        Ok(routes) => routes,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to enumerate IPv6 routes for cleanup");
+            return 0;
+        }
+    };
+
+    let mut removed = 0;
+    for route in routes {
+        if route.header.protocol == RTPROT_BGP {
+            if let Err(e) = handle.route().del(route).execute().await {
+                tracing::warn!(error = %e, "Failed to remove IPv6 BGP route during shutdown");
+            } else {
+                removed += 1;
+            }
+        }
+    }
+
+    removed
 }
