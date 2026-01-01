@@ -132,6 +132,16 @@ impl BgpTransport for MockTransport {
     fn is_connected(&self) -> bool {
         self.connected
     }
+
+    fn peer_addr(&self) -> std::net::SocketAddr {
+        // Return a dummy address for mock transport
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 179)
+    }
+
+    fn accept_incoming(&mut self, _stream: tokio::net::TcpStream) {
+        // Mock transport doesn't actually use the stream
+        self.connected = true;
+    }
 }
 
 #[cfg(test)]

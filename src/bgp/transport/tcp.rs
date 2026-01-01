@@ -53,6 +53,18 @@ impl TcpTransport {
         }
     }
 
+    /// Create a TCP transport from an already-accepted stream.
+    /// Used for incoming connections from a TCP listener.
+    pub fn from_stream(stream: TcpStream, peer_addr: SocketAddr) -> Self {
+        Self {
+            peer_addr,
+            local_addr: None,
+            stream: Some(stream),
+            connect_timeout: CONNECT_TIMEOUT,
+            read_timeout: READ_TIMEOUT,
+        }
+    }
+
     /// Create a TCP transport for an IPv6 link-local peer.
     ///
     /// # Arguments
@@ -224,6 +236,19 @@ impl BgpTransport for TcpTransport {
 
     fn is_connected(&self) -> bool {
         self.stream.is_some()
+    }
+
+    fn peer_addr(&self) -> std::net::SocketAddr {
+        self.peer_addr
+    }
+
+    fn accept_incoming(&mut self, stream: TcpStream) {
+        // Close any existing connection
+        if let Some(old_stream) = self.stream.take() {
+            // Just drop it - the stream will be closed
+            drop(old_stream);
+        }
+        self.stream = Some(stream);
     }
 }
 

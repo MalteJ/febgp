@@ -90,6 +90,13 @@ pub trait BgpTransport: Send {
 
     /// Check if the transport is currently connected.
     fn is_connected(&self) -> bool;
+
+    /// Get the peer address.
+    fn peer_addr(&self) -> std::net::SocketAddr;
+
+    /// Accept an incoming connection, replacing any existing connection.
+    /// This is used for connection collision handling.
+    fn accept_incoming(&mut self, stream: tokio::net::TcpStream);
 }
 
 #[cfg(test)]

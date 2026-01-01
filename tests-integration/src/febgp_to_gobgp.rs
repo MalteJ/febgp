@@ -2293,3 +2293,252 @@ remote_asn = 65002
 
     println!("GoBGP receives routes from FeBGP daemon test passed!");
 }
+
+/// Test that routes are withdrawn when a link goes down and re-installed when it comes back up.
+///
+/// This test simulates a link flap scenario:
+/// 1. Establish BGP session and receive routes
+/// 2. Bring the link down (simulating cable disconnect)
+/// 3. Verify routes are withdrawn from the kernel
+/// 4. Bring the link back up
+/// 5. Verify the BGP session re-establishes and routes are re-installed
+#[test]
+fn test_febgp_link_flap_route_recovery() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create two network namespaces
+    let ns1 = NetNs::new("febgp_test_lf1").expect("Failed to create namespace r1");
+    let ns2 = NetNs::new("febgp_test_lf2").expect("Failed to create namespace r2");
+
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let addr1 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+
+    println!("FeBGP (ns1) link-local: {}", addr1);
+    println!("GoBGP (ns2) link-local: {}", addr2);
+
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    let gobgp = GobgpInstance::start(&ns2, &config2, 50110).expect("Failed to start GoBGP");
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    gobgp
+        .announce_prefix_v4("10.80.0.0/24")
+        .expect("Failed to announce prefix");
+
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_link_flap_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_link_flap_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+"#,
+            addr2
+        ),
+    )
+    .expect("Failed to write config");
+
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon",
+            "-c",
+            &config_path,
+            "--socket",
+            &socket_path,
+            "--install-routes",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for session to establish and routes to be installed
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Verify routes are installed before link down
+    let route_before = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            "ip",
+            "route",
+            "show",
+            "10.80.0.0/24",
+        ])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_before_stdout = String::from_utf8_lossy(&route_before.stdout);
+    println!("Route BEFORE link down:\n{}", route_before_stdout);
+
+    assert!(
+        route_before_stdout.contains("10.80.0.0/24"),
+        "Route should be installed before link down. Got:\n{}",
+        route_before_stdout
+    );
+
+    // === LINK DOWN ===
+    println!("\n=== Bringing link DOWN ===");
+    let link_down = Command::new("ip")
+        .args(["netns", "exec", &ns1.name, "ip", "link", "set", "eth0", "down"])
+        .status()
+        .expect("Failed to bring link down");
+    assert!(link_down.success(), "Failed to bring link down");
+
+    // Wait for TCP connection to fail and routes to be withdrawn
+    // The hold timer is typically 90 seconds, but TCP will fail faster
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Verify routes are removed after link down
+    let route_during_down = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            "ip",
+            "route",
+            "show",
+            "10.80.0.0/24",
+        ])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_during_down_stdout = String::from_utf8_lossy(&route_during_down.stdout);
+    println!("Route DURING link down:\n{}", route_during_down_stdout);
+
+    assert!(
+        route_during_down_stdout.trim().is_empty()
+            || !route_during_down_stdout.contains("10.80.0.0/24"),
+        "Route should be removed during link down. Got:\n{}",
+        route_during_down_stdout
+    );
+
+    // === LINK UP ===
+    println!("\n=== Bringing link UP ===");
+    let link_up = Command::new("ip")
+        .args(["netns", "exec", &ns1.name, "ip", "link", "set", "eth0", "up"])
+        .status()
+        .expect("Failed to bring link up");
+    assert!(link_up.success(), "Failed to bring link up");
+
+    // Wait for link-local address to be available again (DAD)
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Debug: Check link-local addresses after link up
+    let addr1_after = wait_for_link_local(&ns1, "eth0");
+    let addr2_after = wait_for_link_local(&ns2, "eth0");
+    println!(
+        "Link-local addresses after link up - ns1: {:?}, ns2: {:?}",
+        addr1_after, addr2_after
+    );
+
+    // Debug: Check GoBGP neighbor state
+    println!("GoBGP neighbor state after link up:");
+    println!("{}", gobgp.get_neighbor_summary());
+
+    // Wait for BGP session re-establishment and route installation
+    // Poll for the route to appear (with timeout)
+    let mut route_reinstalled = false;
+    for attempt in 1..=15 {
+        let route_check = Command::new("ip")
+            .args([
+                "netns",
+                "exec",
+                &ns1.name,
+                "ip",
+                "route",
+                "show",
+                "10.80.0.0/24",
+            ])
+            .output()
+            .expect("Failed to run ip route show");
+
+        let route_check_stdout = String::from_utf8_lossy(&route_check.stdout);
+        if route_check_stdout.contains("10.80.0.0/24") {
+            println!(
+                "Route re-installed after {} seconds:\n{}",
+                attempt * 2,
+                route_check_stdout
+            );
+            route_reinstalled = true;
+            break;
+        }
+        // Show GoBGP state every 5 attempts
+        if attempt % 5 == 0 {
+            println!("GoBGP state at attempt {}:", attempt);
+            println!("{}", gobgp.get_neighbor_summary());
+        }
+        println!("Attempt {}/15: Route not yet re-installed, waiting...", attempt);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    // Verify routes are re-installed after link up
+    let route_after = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            "ip",
+            "route",
+            "show",
+            "10.80.0.0/24",
+        ])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_after_stdout = String::from_utf8_lossy(&route_after.stdout);
+    if !route_reinstalled {
+        println!("Route AFTER link up (final check):\n{}", route_after_stdout);
+    }
+
+    // Capture daemon output before cleanup
+    let _ = daemon.kill();
+    let output = daemon.wait_with_output();
+    if let Ok(out) = output {
+        println!("FeBGP daemon stdout:\n{}", String::from_utf8_lossy(&out.stdout));
+        println!("FeBGP daemon stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+    drop(gobgp);
+
+    // Final assertion
+    assert!(
+        route_after_stdout.contains("10.80.0.0/24"),
+        "Route should be re-installed after link up. Got:\n{}",
+        route_after_stdout
+    );
+
+    println!("Link flap route recovery test passed!");
+}

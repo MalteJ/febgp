@@ -1,11 +1,12 @@
-use std::net::Ipv4Addr;
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use tokio::net::UnixListener;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
@@ -130,8 +131,11 @@ async fn run_daemon_async(
         }
     }
 
-    // Track command senders for graceful shutdown
+    // Track command senders for graceful shutdown and incoming connection routing
     let mut session_senders: Vec<mpsc::Sender<SessionCommand>> = Vec::new();
+    // Map from peer address (without port) to session command sender
+    let peer_addr_to_sender: Arc<RwLock<HashMap<String, mpsc::Sender<SessionCommand>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     // Spawn BGP sessions for each peer
     for (peer_idx, peer) in config.peers.iter().enumerate() {
@@ -151,8 +155,46 @@ async fn run_daemon_async(
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(16);
         session_senders.push(cmd_tx.clone());
 
+        // Register this peer's address for incoming connection routing
+        if let Ok(peer_addr) = parse_peer_address(peer) {
+            let addr_key = extract_ip_addr(&peer_addr);
+            let mut map = peer_addr_to_sender.write().await;
+            map.insert(addr_key, cmd_tx.clone());
+        }
+
         tokio::spawn(async move {
             run_peer_session(ctx, cmd_tx, cmd_rx).await;
+        });
+    }
+
+    // Start TCP listener for incoming BGP connections (non-fatal if it fails)
+    let bgp_listener = TcpListener::bind("[::]:179").await.ok();
+
+    // Spawn incoming connection handler
+    if let Some(listener) = bgp_listener {
+        let peer_map = Arc::clone(&peer_addr_to_sender);
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer_addr)) => {
+                        let addr_key = extract_ip_addr(&peer_addr);
+                        println!("Incoming BGP connection from {}", peer_addr);
+
+                        let map = peer_map.read().await;
+                        if let Some(sender) = map.get(&addr_key) {
+                            if let Err(e) = sender.send(SessionCommand::IncomingConnection(stream)).await {
+                                eprintln!("Failed to route incoming connection: {}", e);
+                            }
+                        } else {
+                            println!("Dropping connection from unknown peer: {}", peer_addr);
+                            // stream is dropped, closing the connection
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error accepting connection: {}", e);
+                    }
+                }
+            }
         });
     }
 
@@ -438,6 +480,18 @@ async fn run_peer_session(
                     println!("Removed {} route(s) from peer {}", removed, peer_idx);
                 }
                 established_at = None;
+
+                // Automatic reconnection after a short delay
+                let cmd_tx_clone = cmd_tx.clone();
+                tokio::spawn(async move {
+                    // Wait before attempting reconnection (avoids tight reconnect loop)
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    println!("Attempting to reconnect to peer...");
+                    match cmd_tx_clone.send(SessionCommand::Start).await {
+                        Ok(()) => println!("Reconnect command sent to {}", peer_addr),
+                        Err(e) => eprintln!("Failed to send reconnect command: {}", e),
+                    }
+                });
             }
             SessionEvent::UpdateReceived(data) => {
                 // Parse UPDATE and add routes to RIB
@@ -503,5 +557,22 @@ async fn update_uptime(state: &Arc<RwLock<DaemonState>>, peer_idx: usize, uptime
     let mut s = state.write().await;
     if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
         neighbor.uptime_secs = uptime_secs;
+    }
+}
+
+/// Extract the IP address from a SocketAddr as a string (without port).
+/// For IPv6 link-local addresses, includes the scope ID.
+fn extract_ip_addr(addr: &SocketAddr) -> String {
+    match addr {
+        SocketAddr::V4(v4) => v4.ip().to_string(),
+        SocketAddr::V6(v6) => {
+            let ip = v6.ip();
+            if v6.scope_id() != 0 {
+                // Link-local address with scope ID
+                format!("{}%{}", ip, v6.scope_id())
+            } else {
+                ip.to_string()
+            }
+        }
     }
 }

@@ -4,9 +4,11 @@
 //! It integrates the pure FSM with the transport layer.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -18,7 +20,6 @@ use crate::bgp::message::{KeepaliveMessage, Message, OpenMessage};
 use crate::bgp::transport::{BgpTransport, TransportError};
 
 /// Commands that can be sent to the session actor.
-#[derive(Debug)]
 pub enum SessionCommand {
     /// Start the BGP session.
     Start,
@@ -26,6 +27,19 @@ pub enum SessionCommand {
     Stop,
     /// Send an UPDATE message (body only, without BGP header).
     SendUpdate(Vec<u8>),
+    /// Inject an incoming connection (from TCP listener).
+    IncomingConnection(TcpStream),
+}
+
+impl fmt::Debug for SessionCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Start => write!(f, "Start"),
+            Self::Stop => write!(f, "Stop"),
+            Self::SendUpdate(data) => write!(f, "SendUpdate({} bytes)", data.len()),
+            Self::IncomingConnection(_) => write!(f, "IncomingConnection(<TcpStream>)"),
+        }
+    }
 }
 
 /// Events emitted by the session actor.
@@ -170,6 +184,52 @@ impl<T: BgpTransport> SessionActor<T> {
                     }
                 }
             }
+            SessionCommand::IncomingConnection(stream) => {
+                // Handle incoming connection from TCP listener
+                self.handle_incoming_connection(stream).await;
+            }
+        }
+    }
+
+    /// Handle an incoming connection from the TCP listener.
+    /// This implements RFC 4271 collision detection.
+    async fn handle_incoming_connection(&mut self, stream: TcpStream) {
+        let current_state = self.fsm.state();
+
+        match current_state {
+            FsmState::Idle => {
+                // No active connection, accept the incoming one
+                self.transport.accept_incoming(stream);
+                // Trigger connection confirmed event
+                self.process_event(FsmEvent::Tcp(TcpEvent::TcpConnectionConfirmed))
+                    .await;
+            }
+            FsmState::Connect | FsmState::Active => {
+                // We're trying to connect outbound, but got an inbound connection
+                // This is a collision - per RFC 4271, we'll accept the incoming
+                // connection and close any outbound attempt since we're not yet
+                // in OpenSent (haven't received their OPEN to compare router IDs)
+                let _ = self.transport.close().await; // Close outbound attempt
+                self.transport.accept_incoming(stream);
+                // Trigger connection confirmed event
+                self.process_event(FsmEvent::Tcp(TcpEvent::TcpConnectionConfirmed))
+                    .await;
+            }
+            FsmState::OpenSent | FsmState::OpenConfirm => {
+                // RFC 4271 Section 6.8: Connection Collision Detection
+                // We've sent OPEN on the outbound connection, now have inbound
+                // Compare BGP Identifiers to decide which to keep:
+                // - If our ID is higher, drop incoming, keep outbound
+                // - If our ID is lower, drop outbound, accept incoming
+                // We don't know their ID yet on the incoming connection,
+                // so we temporarily accept both and let the OPEN comparison decide
+                // For now, drop the incoming since we already sent OPEN on outbound
+                drop(stream);
+            }
+            FsmState::Established => {
+                // Already have an established session, drop incoming
+                drop(stream);
+            }
         }
     }
 
@@ -230,7 +290,7 @@ impl<T: BgpTransport> SessionActor<T> {
                     Ok(()) => {
                         return Some(FsmEvent::Tcp(TcpEvent::TcpCrAcked));
                     }
-                    Err(_) => {
+                    Err(_e) => {
                         return Some(FsmEvent::Tcp(TcpEvent::TcpConnectionFails));
                     }
                 }
