@@ -265,7 +265,7 @@ impl Rib {
             .map(|r| (r.prefix.clone(), r.next_hop.clone()))
             .collect();
 
-        // Calculate diff
+        // Calculate diff for return value
         let to_install: Vec<(String, String)> = currently_best
             .iter()
             .filter(|(p, nh)| !previously_best.iter().any(|(pp, pnh)| pp == p && pnh == nh))
@@ -278,18 +278,19 @@ impl Rib {
             .cloned()
             .collect();
 
-        // Apply kernel route changes using the reusable netlink handle
+        // Update kernel route with all current nexthops (multipath/replace)
         if let Some(ref netlink) = self.netlink {
-            for (prefix, next_hop) in &to_install {
-                if let Err(e) = netlink.install_route(prefix, next_hop).await {
-                    tracing::warn!(prefix = %prefix, error = %e, "Failed to install route");
-                }
-            }
+            let nexthops: Vec<String> = currently_best
+                .iter()
+                .map(|(_, nh)| nh.clone())
+                .collect();
 
-            for (prefix, next_hop) in &to_remove {
-                if let Err(e) = netlink.remove_route(prefix, next_hop).await {
-                    tracing::warn!(prefix = %prefix, error = %e, "Failed to remove route");
+            if nexthops.is_empty() {
+                if let Err(e) = netlink.remove_prefix(&prefix).await {
+                    tracing::warn!(prefix = %prefix, error = %e, "Failed to remove prefix");
                 }
+            } else if let Err(e) = netlink.set_route(&prefix, &nexthops).await {
+                tracing::warn!(prefix = %prefix, error = %e, "Failed to set route");
             }
         }
 
@@ -316,52 +317,31 @@ impl Rib {
             .map(|(p, _, _)| p.clone())
             .collect();
 
-        // Get remaining best routes (from OTHER peers) BEFORE removal
-        let mut remaining_best_before: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for prefix in &affected_prefixes {
-            let best_routes: Vec<String> = self
-                .routes
-                .iter()
-                .filter(|r| r.prefix == *prefix && r.best && r.peer_idx != peer_idx)
-                .map(|r| r.next_hop.clone())
-                .collect();
-            remaining_best_before.insert(prefix.clone(), best_routes);
-        }
-
-        // Remove routes
+        // Remove routes from RIB
         let removed_count = routes_to_remove.len();
         self.routes.retain(|r| r.peer_idx != peer_idx);
 
-        // Recalculate best paths and update kernel
+        // Recalculate best paths and update kernel for each affected prefix
         for prefix in &affected_prefixes {
             recalculate_best_paths(&mut self.routes, prefix);
 
             if let Some(ref netlink) = self.netlink {
-                // Remove routes from this peer that were best
-                for (p, nh, was_best) in &routes_to_remove {
-                    if p == prefix && *was_best {
-                        if let Err(e) = netlink.remove_route(p, nh).await {
-                            tracing::warn!(prefix = %p, error = %e, "Failed to remove route");
-                        }
-                    }
-                }
-
-                // Install newly best routes (failover)
-                let currently_best: Vec<String> = self
+                // Get all currently best nexthops for this prefix
+                let nexthops: Vec<String> = self
                     .routes
                     .iter()
                     .filter(|r| r.prefix == *prefix && r.best)
                     .map(|r| r.next_hop.clone())
                     .collect();
 
-                let previously_best = remaining_best_before.get(prefix).cloned().unwrap_or_default();
-                for next_hop in &currently_best {
-                    if !previously_best.contains(next_hop) {
-                        if let Err(e) = netlink.install_route(prefix, next_hop).await {
-                            tracing::warn!(prefix = %prefix, error = %e, "Failed to install failover route");
-                        }
+                if nexthops.is_empty() {
+                    // No more routes for this prefix - remove from kernel
+                    if let Err(e) = netlink.remove_prefix(prefix).await {
+                        tracing::warn!(prefix = %prefix, error = %e, "Failed to remove prefix");
                     }
+                } else if let Err(e) = netlink.set_route(prefix, &nexthops).await {
+                    // Update with remaining nexthops (multipath/replace)
+                    tracing::warn!(prefix = %prefix, error = %e, "Failed to set failover route");
                 }
             }
         }

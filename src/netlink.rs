@@ -2,30 +2,28 @@
 //!
 //! # Implementation Notes
 //!
-//! Route **removal** uses native rtnetlink where possible:
-//! - IPv4 routes with IPv4 gateways: rtnetlink
-//! - IPv6 routes with IPv6 gateways: rtnetlink
-//! - IPv4 routes with IPv6 gateways (RFC 5549): shell (`ip route del`)
-//!   - rtnetlink doesn't reliably expose RTA_VIA attributes when enumerating routes
-//!
-//! Route **installation** uses the `ip` command for ECMP support:
-//! - rtnetlink's `RouteAddRequest` doesn't expose `NLM_F_APPEND` flag
-//! - Without append semantics, adding a second route to the same prefix fails
-//! - The `ip route append` command handles ECMP correctly
-//!
-//! For IPv4-via-IPv6 routes (RFC 5549), both install and remove use `ip` command:
-//! - Requires `via inet6` syntax which maps to the RTA_VIA netlink attribute
-//! - rtnetlink's high-level API doesn't provide reliable RTA_VIA support
+//! Uses multipath routes with `replace` semantics:
+//! - A single route entry per prefix with multiple nexthops (ECMP)
+//! - Idempotent: calling with the same nexthops is a no-op
+//! - Atomic: the route is replaced in a single operation
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use futures::TryStreamExt;
 use netlink_packet_route::route::{RouteMessage, RouteProtocol};
 use netlink_packet_route::AddressFamily;
-use rtnetlink::Handle;
+use rtnetlink::{Handle, RouteMessageBuilder, RouteNextHopBuilder};
+use libc;
 
 /// Protocol ID for BGP routes (186 = BGP per IANA)
 const RTPROT_BGP: RouteProtocol = RouteProtocol::Other(186);
+
+/// Parsed next-hop with interface information.
+#[derive(Debug, Clone)]
+pub struct NextHop {
+    pub gateway: IpAddr,
+    pub interface: Option<String>,
+}
 
 /// A reusable netlink connection handle for route operations.
 ///
@@ -47,37 +45,214 @@ impl NetlinkHandle {
         Ok(Self { handle })
     }
 
-    /// Install a route into the Linux routing table.
+    /// Set the nexthops for a prefix (create or replace).
     ///
-    /// Supports:
-    /// - IPv4 prefix with IPv4 gateway
-    /// - IPv6 prefix with IPv6 gateway
-    /// - IPv4 prefix with IPv6 gateway (RFC 5549, BGP unnumbered) - requires interface
-    pub async fn install_route(&self, prefix: &str, next_hop: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (dest, prefix_len) = parse_prefix(prefix)?;
-        let (gateway, interface) = parse_next_hop_with_interface(next_hop)?;
+    /// This is the main route management function. It:
+    /// - Creates the route if it doesn't exist
+    /// - Replaces it if it does (with all provided nexthops)
+    /// - Uses multipath for ECMP when multiple nexthops are provided
+    ///
+    /// If `nexthops` is empty, this is a no-op. Use `remove_prefix` to delete.
+    pub async fn set_route(
+        &self,
+        prefix: &str,
+        nexthops: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if nexthops.is_empty() {
+            return Ok(());
+        }
 
-        match (dest, gateway) {
-            (IpAddr::V4(dest), IpAddr::V4(gw)) => {
-                install_route_v4(&self.handle, dest, prefix_len, gw).await?;
+        let (dest, prefix_len) = parse_prefix(prefix)?;
+
+        // Parse all nexthops
+        let parsed_nexthops: Vec<NextHop> = nexthops
+            .iter()
+            .map(|nh| parse_next_hop_with_interface(nh))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        match dest {
+            IpAddr::V4(dest) => {
+                self.set_route_v4(dest, prefix_len, &parsed_nexthops).await?;
             }
-            (IpAddr::V6(dest), IpAddr::V6(gw)) => {
-                install_route_v6(&self.handle, dest, prefix_len, gw, interface.as_deref()).await?;
-            }
-            (IpAddr::V4(dest), IpAddr::V6(gw)) => {
-                // IPv4 over IPv6 next-hop (RFC 5549) - requires interface
-                if let Some(if_name) = interface {
-                    install_route_v4_via_v6(&self.handle, dest, prefix_len, gw, &if_name).await?;
-                } else {
-                    return Err("IPv4 route with IPv6 next-hop requires interface (e.g., fe80::1%eth0)".into());
-                }
-            }
-            (IpAddr::V6(_), IpAddr::V4(_)) => {
-                return Err("IPv6 route with IPv4 next-hop is not supported".into());
+            IpAddr::V6(dest) => {
+                self.set_route_v6(dest, prefix_len, &parsed_nexthops).await?;
             }
         }
 
         Ok(())
+    }
+
+    /// Remove a prefix from the routing table.
+    ///
+    /// Removes all routes for the given prefix with RTPROT_BGP protocol.
+    pub async fn remove_prefix(&self, prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (dest, prefix_len) = parse_prefix(prefix)?;
+
+        match dest {
+            IpAddr::V4(dest) => {
+                self.remove_prefix_v4(dest, prefix_len).await?;
+            }
+            IpAddr::V6(dest) => {
+                self.remove_prefix_v6(dest, prefix_len).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set IPv4 route with multipath support.
+    async fn set_route_v4(
+        &self,
+        dest: Ipv4Addr,
+        prefix_len: u8,
+        nexthops: &[NextHop],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if nexthops.is_empty() {
+            return Ok(());
+        }
+
+        // Build nexthop entries
+        let mut nh_entries = Vec::new();
+        for nh in nexthops {
+            let if_name = nh.interface.as_deref().ok_or_else(|| {
+                format!("Interface required for nexthop {:?}", nh.gateway)
+            })?;
+            let if_index = nix::net::if_::if_nametoindex(if_name)
+                .map_err(|e| format!("Failed to get interface index for {}: {}", if_name, e))?;
+
+            let entry = match nh.gateway {
+                IpAddr::V4(gw) => {
+                    RouteNextHopBuilder::new_ipv4()
+                        .interface(if_index)
+                        .via(IpAddr::V4(gw))
+                        .map_err(|e| format!("Failed to build nexthop: {:?}", e))?
+                        .build()
+                }
+                IpAddr::V6(gw) => {
+                    // IPv4 route with IPv6 gateway (RFC 5549)
+                    RouteNextHopBuilder::new_ipv4()
+                        .interface(if_index)
+                        .via(IpAddr::V6(gw))
+                        .map_err(|e| format!("Failed to build nexthop: {:?}", e))?
+                        .build()
+                }
+            };
+            nh_entries.push(entry);
+        }
+
+        let message = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(dest, prefix_len)
+            .protocol(RTPROT_BGP)
+            .multipath(nh_entries)
+            .build();
+
+        self.handle
+            .route()
+            .add(message)
+            .replace()
+            .execute()
+            .await
+            .map_err(|e| format!("Failed to set IPv4 route: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Set IPv6 route with multipath support.
+    async fn set_route_v6(
+        &self,
+        dest: Ipv6Addr,
+        prefix_len: u8,
+        nexthops: &[NextHop],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if nexthops.is_empty() {
+            return Ok(());
+        }
+
+        // Build nexthop entries
+        let mut nh_entries = Vec::new();
+        for nh in nexthops {
+            let gw = match nh.gateway {
+                IpAddr::V6(gw) => gw,
+                IpAddr::V4(_) => {
+                    return Err("IPv6 route cannot have IPv4 gateway".into());
+                }
+            };
+
+            let mut builder = RouteNextHopBuilder::new_ipv6()
+                .via(IpAddr::V6(gw))
+                .map_err(|e| format!("Failed to build nexthop: {:?}", e))?;
+
+            // Add interface if provided (required for link-local)
+            if let Some(ref if_name) = nh.interface {
+                let if_index = nix::net::if_::if_nametoindex(if_name.as_str())
+                    .map_err(|e| format!("Failed to get interface index for {}: {}", if_name, e))?;
+                builder = builder.interface(if_index);
+            }
+
+            nh_entries.push(builder.build());
+        }
+
+        let message = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(dest, prefix_len)
+            .protocol(RTPROT_BGP)
+            .multipath(nh_entries)
+            .build();
+
+        self.handle
+            .route()
+            .add(message)
+            .replace()
+            .execute()
+            .await
+            .map_err(|e| format!("Failed to set IPv6 route: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Remove all BGP routes for an IPv4 prefix.
+    async fn remove_prefix_v4(
+        &self,
+        dest: Ipv4Addr,
+        prefix_len: u8,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Build a delete message for the specific prefix
+        let message = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(dest, prefix_len)
+            .protocol(RTPROT_BGP)
+            .build();
+
+        // Try to delete - ignore error if route doesn't exist
+        match self.handle.route().del(message).execute().await {
+            Ok(_) => Ok(()),
+            Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -libc::ESRCH => {
+                // Route not found - that's fine
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to remove IPv4 prefix: {}", e).into()),
+        }
+    }
+
+    /// Remove all BGP routes for an IPv6 prefix.
+    async fn remove_prefix_v6(
+        &self,
+        dest: Ipv6Addr,
+        prefix_len: u8,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Build a delete message for the specific prefix
+        let message = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(dest, prefix_len)
+            .protocol(RTPROT_BGP)
+            .build();
+
+        // Try to delete - ignore error if route doesn't exist
+        match self.handle.route().del(message).execute().await {
+            Ok(_) => Ok(()),
+            Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -libc::ESRCH => {
+                // Route not found - that's fine
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to remove IPv6 prefix: {}", e).into()),
+        }
     }
 
     /// Remove all BGP routes from the kernel routing table.
@@ -96,195 +271,6 @@ impl NetlinkHandle {
         removed
     }
 
-    /// Remove a route from the Linux routing table.
-    pub async fn remove_route(&self, prefix: &str, next_hop: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (dest, prefix_len) = parse_prefix(prefix)?;
-        let (gateway, interface) = parse_next_hop_with_interface(next_hop)?;
-
-        match (dest, gateway) {
-            (IpAddr::V4(dest), IpAddr::V4(gw)) => {
-                remove_route_v4(&self.handle, dest, prefix_len, gw).await?;
-            }
-            (IpAddr::V6(dest), IpAddr::V6(gw)) => {
-                remove_route_v6(&self.handle, dest, prefix_len, gw, interface.as_deref()).await?;
-            }
-            (IpAddr::V4(dest), IpAddr::V6(gw)) => {
-                // IPv4 via IPv6 removal - need next-hop and interface for ECMP
-                if let Some(ref if_name) = interface {
-                    remove_route_v4_via_v6(&self.handle, dest, prefix_len, gw, if_name).await?;
-                } else {
-                    // Fallback: remove by prefix only (removes all matching routes)
-                    remove_route_v4_any(&self.handle, dest, prefix_len).await?;
-                }
-            }
-            _ => {
-                return Err("Address family mismatch not supported for removal".into());
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Install IPv4 route with IPv4 gateway.
-/// Uses `ip route append` to support ECMP (multiple next-hops for same prefix).
-async fn install_route_v4(
-    _handle: &Handle,
-    dest: std::net::Ipv4Addr,
-    prefix_len: u8,
-    gateway: std::net::Ipv4Addr,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-
-    let prefix = format!("{}/{}", dest, prefix_len);
-    let gateway_str = gateway.to_string();
-
-    let output = Command::new("ip")
-        .args([
-            "route", "append",
-            &prefix,
-            "via", &gateway_str,
-            "proto", "bgp",
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ip route append failed: {}", stderr).into());
-    }
-
-    Ok(())
-}
-
-/// Install IPv6 route with IPv6 gateway.
-/// Uses `ip route append` to support ECMP (multiple next-hops for same prefix).
-/// Interface is required for link-local next-hops (fe80::).
-async fn install_route_v6(
-    _handle: &Handle,
-    dest: std::net::Ipv6Addr,
-    prefix_len: u8,
-    gateway: std::net::Ipv6Addr,
-    interface: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-
-    let prefix = format!("{}/{}", dest, prefix_len);
-    let gateway_str = gateway.to_string();
-
-    // Build arguments - include "dev <interface>" if provided (required for link-local next-hops)
-    let mut args = vec![
-        "-6", "route", "append",
-        &prefix,
-        "via", &gateway_str,
-    ];
-
-    let interface_owned: String;
-    if let Some(if_name) = interface {
-        interface_owned = if_name.to_string();
-        args.push("dev");
-        args.push(&interface_owned);
-    }
-
-    args.push("proto");
-    args.push("bgp");
-
-    let output = Command::new("ip")
-        .args(&args)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ip route append failed: {}", stderr).into());
-    }
-
-    Ok(())
-}
-
-async fn remove_route_v4(
-    handle: &Handle,
-    dest: std::net::Ipv4Addr,
-    prefix_len: u8,
-    _gateway: std::net::Ipv4Addr,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Find and delete matching routes
-    let mut filter = RouteMessage::default();
-    filter.header.address_family = AddressFamily::Inet;
-    let mut routes = handle.route().get(filter).execute();
-
-    while let Some(route) = routes.try_next().await? {
-        // Check if this route matches our prefix
-        if let Some((route_dest, route_prefix_len)) = get_route_v4_dest(&route) {
-            if route_dest == dest && route_prefix_len == prefix_len {
-                // Check if it's a BGP route (protocol 186)
-                if route.header.protocol == RTPROT_BGP {
-                    handle.route().del(route).execute().await?;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn remove_route_v6(
-    handle: &Handle,
-    dest: std::net::Ipv6Addr,
-    prefix_len: u8,
-    _gateway: std::net::Ipv6Addr,
-    _interface: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Find and delete matching routes
-    // Note: rtnetlink can delete routes without specifying the interface,
-    // even for routes with link-local next-hops
-    let mut filter = RouteMessage::default();
-    filter.header.address_family = AddressFamily::Inet6;
-    let mut routes = handle.route().get(filter).execute();
-
-    while let Some(route) = routes.try_next().await? {
-        // Check if this route matches our prefix
-        if let Some((route_dest, route_prefix_len)) = get_route_v6_dest(&route) {
-            if route_dest == dest && route_prefix_len == prefix_len {
-                // Check if it's a BGP route (protocol 186)
-                if route.header.protocol == RTPROT_BGP {
-                    handle.route().del(route).execute().await?;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn get_route_v4_dest(
-    route: &netlink_packet_route::route::RouteMessage,
-) -> Option<(std::net::Ipv4Addr, u8)> {
-    use netlink_packet_route::route::{RouteAddress, RouteAttribute};
-
-    let prefix_len = route.header.destination_prefix_length;
-
-    for attr in &route.attributes {
-        if let RouteAttribute::Destination(RouteAddress::Inet(addr)) = attr {
-            return Some((*addr, prefix_len));
-        }
-    }
-
-    None
-}
-
-fn get_route_v6_dest(
-    route: &netlink_packet_route::route::RouteMessage,
-) -> Option<(std::net::Ipv6Addr, u8)> {
-    use netlink_packet_route::route::{RouteAddress, RouteAttribute};
-
-    let prefix_len = route.header.destination_prefix_length;
-
-    for attr in &route.attributes {
-        if let RouteAttribute::Destination(RouteAddress::Inet6(addr)) = attr {
-            return Some((*addr, prefix_len));
-        }
-    }
-
-    None
 }
 
 fn parse_prefix(prefix: &str) -> Result<(IpAddr, u8), Box<dyn std::error::Error>> {
@@ -300,115 +286,20 @@ fn parse_prefix(prefix: &str) -> Result<(IpAddr, u8), Box<dyn std::error::Error>
 }
 
 /// Parse next-hop address and optional interface (e.g., "fe80::1%eth0" -> (fe80::1, Some("eth0")))
-fn parse_next_hop_with_interface(next_hop: &str) -> Result<(IpAddr, Option<String>), Box<dyn std::error::Error>> {
+fn parse_next_hop_with_interface(next_hop: &str) -> Result<NextHop, Box<dyn std::error::Error>> {
     if let Some(pos) = next_hop.find('%') {
         let addr_str = &next_hop[..pos];
         let interface = &next_hop[pos + 1..];
-        Ok((addr_str.parse()?, Some(interface.to_string())))
+        Ok(NextHop {
+            gateway: addr_str.parse()?,
+            interface: Some(interface.to_string()),
+        })
     } else {
-        Ok((next_hop.parse()?, None))
+        Ok(NextHop {
+            gateway: next_hop.parse()?,
+            interface: None,
+        })
     }
-}
-
-/// Install IPv4 route with IPv6 gateway (RFC 5549 / BGP unnumbered).
-/// This uses the `ip` command because rtnetlink doesn't easily support RTA_VIA.
-/// Uses `ip route append` to support ECMP (multiple next-hops for same prefix).
-async fn install_route_v4_via_v6(
-    _handle: &Handle,
-    dest: std::net::Ipv4Addr,
-    prefix_len: u8,
-    gateway: std::net::Ipv6Addr,
-    interface: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-
-    // Use `ip route append` with `via inet6` for IPv4 over IPv6 next-hop
-    // `append` allows multiple next-hops for ECMP instead of failing with "File exists"
-    // Example: ip route append 10.0.0.0/24 via inet6 fe80::1 dev eth0 proto bgp
-    let prefix = format!("{}/{}", dest, prefix_len);
-    let gateway_str = gateway.to_string();
-
-    let output = Command::new("ip")
-        .args([
-            "route", "append",
-            &prefix,
-            "via", "inet6", &gateway_str,
-            "dev", interface,
-            "proto", "bgp",
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ip route append failed: {}", stderr).into());
-    }
-
-    Ok(())
-}
-
-/// Remove IPv4 route with IPv6 gateway (specific next-hop for ECMP).
-///
-/// Uses shell command because rtnetlink's route enumeration doesn't reliably
-/// expose the RTA_VIA attribute for IPv4-via-IPv6 routes in a way we can match.
-async fn remove_route_v4_via_v6(
-    _handle: &Handle,
-    dest: std::net::Ipv4Addr,
-    prefix_len: u8,
-    gateway: std::net::Ipv6Addr,
-    interface: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-
-    let prefix = format!("{}/{}", dest, prefix_len);
-    let gateway_str = gateway.to_string();
-
-    // Delete specific route with next-hop and interface
-    let output = Command::new("ip")
-        .args([
-            "route", "del",
-            &prefix,
-            "via", "inet6", &gateway_str,
-            "dev", interface,
-            "proto", "bgp",
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "No such process" error (route doesn't exist)
-        if !stderr.contains("No such process") && !stderr.contains("RTNETLINK answers: No such process") {
-            return Err(format!("ip route del failed: {}", stderr).into());
-        }
-    }
-
-    Ok(())
-}
-
-/// Remove IPv4 route by prefix only (fallback when next-hop is unknown).
-/// Removes all BGP routes matching the destination prefix.
-async fn remove_route_v4_any(
-    handle: &Handle,
-    dest: std::net::Ipv4Addr,
-    prefix_len: u8,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Find and delete all matching BGP routes
-    let mut filter = RouteMessage::default();
-    filter.header.address_family = AddressFamily::Inet;
-    let mut routes = handle.route().get(filter).execute();
-
-    while let Some(route) = routes.try_next().await? {
-        // Check if this route matches our prefix
-        if let Some((route_dest, route_prefix_len)) = get_route_v4_dest(&route) {
-            if route_dest == dest && route_prefix_len == prefix_len {
-                // Check if it's a BGP route (protocol 186)
-                if route.header.protocol == RTPROT_BGP {
-                    handle.route().del(route).execute().await?;
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// Remove all IPv4 BGP routes from the kernel.
