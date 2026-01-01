@@ -1,7 +1,8 @@
 /// BGP FSM States per RFC 4271 Section 8.2.2
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FsmState {
     /// Initial state. No resources allocated.
+    #[default]
     Idle,
     /// Waiting for TCP connection to complete (active open).
     Connect,
@@ -28,12 +29,6 @@ impl FsmState {
     #[allow(dead_code)]
     pub fn is_established(&self) -> bool {
         matches!(self, FsmState::Established)
-    }
-}
-
-impl Default for FsmState {
-    fn default() -> Self {
-        FsmState::Idle
     }
 }
 

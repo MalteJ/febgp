@@ -114,7 +114,7 @@ impl TcpTransport {
         let msg_type = header_buf[18];
 
         // Validate length
-        if length < BGP_HEADER_LEN || length > MAX_MESSAGE_SIZE {
+        if !(BGP_HEADER_LEN..=MAX_MESSAGE_SIZE).contains(&length) {
             return Err(TransportError::InvalidMessage(format!(
                 "Invalid message length: {}",
                 length

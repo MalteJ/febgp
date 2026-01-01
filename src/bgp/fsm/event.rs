@@ -35,7 +35,7 @@ pub enum AdminEvent {
 /// Not yet implemented:
 /// - `DelayOpenTimerExpires` (12): For delayed OPEN feature
 /// - `IdleHoldTimerExpires` (13): For peer oscillation damping
-#[allow(dead_code)]
+#[allow(dead_code, clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerEvent {
     /// Event 9: ConnectRetryTimer has expired.
@@ -59,7 +59,7 @@ pub enum TimerEvent {
 ///
 /// Not implemented (requires passive mode):
 /// - `TcpConnectionConfirmed` (17): For incoming connections
-#[allow(dead_code)]
+#[allow(dead_code, clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpEvent {
     /// Event 16: TCP connection request acknowledged (active open succeeded).
