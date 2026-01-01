@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package febgp;
+
+service FebgpService {
+    // Get daemon status and all neighbors
+    rpc GetStatus(Empty) returns (StatusResponse);
+
+    // Get BGP routes
+    rpc GetRoutes(Empty) returns (RoutesResponse);
+}
+
+message Empty {}
+
+message StatusResponse {
+    uint32 asn = 1;
+    string router_id = 2;
+    repeated Neighbor neighbors = 3;
+}
+
+message Neighbor {
+    string address = 1;
+    string interface = 2;
+    uint32 remote_asn = 3;
+    string state = 4;  // Idle, Connect, Active, OpenSent, OpenConfirm, Established
+    uint64 uptime_secs = 5;
+    uint64 prefixes_received = 6;
+}
+
+message RoutesResponse {
+    repeated Route routes = 1;
+}
+
+message Route {
+    string prefix = 1;
+    string next_hop = 2;
+    string as_path = 3;
+    string origin = 4;
+    bool best = 5;
+}

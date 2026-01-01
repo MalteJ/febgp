@@ -20,10 +20,10 @@ impl NetNs {
             .status()?;
 
         if !status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to create netns {}", name),
-            ));
+            return Err(io::Error::other(format!(
+                "Failed to create netns {}",
+                name
+            )));
         }
 
         // Bring up loopback
@@ -34,10 +34,10 @@ impl NetNs {
         if !status.success() {
             // Clean up the namespace we just created
             let _ = Command::new("ip").args(["netns", "del", name]).status();
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to bring up loopback in {}", name),
-            ));
+            return Err(io::Error::other(format!(
+                "Failed to bring up loopback in {}",
+                name
+            )));
         }
 
         Ok(Self {
@@ -102,10 +102,7 @@ pub fn create_veth_pair(
         .status()?;
 
     if !status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Failed to create veth pair",
-        ));
+        return Err(io::Error::other("Failed to create veth pair"));
     }
 
     // Move the peer to ns2
@@ -117,10 +114,7 @@ pub fn create_veth_pair(
         .status()?;
 
     if !status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Failed to move veth to second namespace",
-        ));
+        return Err(io::Error::other("Failed to move veth to second namespace"));
     }
 
     // Rename the peer in ns2 to the desired name
@@ -132,10 +126,10 @@ pub fn create_veth_pair(
         .status()?;
 
     if !status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to rename {} to {}", temp_peer, iface2),
-        ));
+        return Err(io::Error::other(format!(
+            "Failed to rename {} to {}",
+            temp_peer, iface2
+        )));
     }
 
     // Bring up both interfaces
@@ -144,10 +138,7 @@ pub fn create_veth_pair(
         .status()?;
 
     if !status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to bring up {}", iface1),
-        ));
+        return Err(io::Error::other(format!("Failed to bring up {}", iface1)));
     }
 
     let status = Command::new("ip")
@@ -155,16 +146,14 @@ pub fn create_veth_pair(
         .status()?;
 
     if !status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to bring up {}", iface2),
-        ));
+        return Err(io::Error::other(format!("Failed to bring up {}", iface2)));
     }
 
     Ok(())
 }
 
 /// Wait for a condition with timeout
+#[allow(dead_code)]
 pub fn wait_for<F>(mut condition: F, timeout_secs: u64, poll_ms: u64) -> bool
 where
     F: FnMut() -> bool,

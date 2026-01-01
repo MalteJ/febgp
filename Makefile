@@ -14,9 +14,7 @@ TOOLS_DIR := tools
 .PHONY: test test-integration clean build tools
 
 build:
-	cargo build
-
-test: tools test-integration
+	cargo build --workspace
 
 # Download gobgp binaries
 tools: $(TOOLS_DIR)/gobgpd
@@ -26,9 +24,8 @@ $(TOOLS_DIR)/gobgpd:
 	curl -sL $(GOBGP_URL) | tar xz -C $(TOOLS_DIR)
 	@echo "Downloaded gobgp $(GOBGP_VERSION) for $(GOBGP_ARCH)"
 
-# Integration tests require root for network namespaces
-test-integration: tools
-	@sudo -E cargo test --test gobgp_to_gobgp -- --nocapture; \
+test: tools build
+	@sudo -E cargo test -p tests-integration -- --nocapture; \
 	status=$$?; \
 	sudo ip netns del febgp_test_r1 2>/dev/null || true; \
 	sudo ip netns del febgp_test_r2 2>/dev/null || true; \

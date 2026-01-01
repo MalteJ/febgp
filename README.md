@@ -1,19 +1,16 @@
 # FeBGP
 
-A BGP-4 daemon written in Rust.
-
-## Structure
-
-- `bgp/` - Protocol library for BGP message encoding/decoding and session management
-- `febgpd/` - The BGP daemon binary
-- `tests-integration/` - Integration tests using GoBGP
+A BGP daemon written in Rust, designed for BGP unnumbered deployments.
 
 ## Features
 
 - BGP-4 protocol (RFC 4271)
-- IPv6 link-local peering support
+- BGP unnumbered with IPv6 link-local peering
+- Auto-detection of remote ASN from peer's OPEN message
 - 4-octet ASN capability (RFC 6793)
-- Multiprotocol extensions (RFC 4760)
+- Multiprotocol extensions for IPv6 (RFC 4760)
+- gRPC API for status and route queries
+- TOML configuration
 
 ## Building
 
@@ -21,22 +18,70 @@ A BGP-4 daemon written in Rust.
 cargo build --release
 ```
 
-## Running
+## Usage
+
+### Run the daemon
 
 ```sh
-./target/release/febgpd
+febgp daemon --config config.toml
 ```
+
+### Query status
+
+```sh
+febgp status
+```
+
+### Query routes
+
+```sh
+febgp routes
+```
+
+## Configuration
+
+Create a `config.toml`:
+
+```toml
+asn = 65001
+router_id = "1.1.1.1"
+prefixes = ["2001:db8::/32"]
+
+# BGP unnumbered - just specify the interface
+[[peer]]
+interface = "eth0"
+
+# Or with explicit peer address
+[[peer]]
+interface = "eth1"
+address = "fe80::1"
+```
+
+See [docs/configuration.md](docs/configuration.md) for full configuration reference.
 
 ## Testing
 
+Integration tests use GoBGP and require root privileges for network namespace setup:
+
 ```sh
-cargo test
+make test
 ```
 
-Integration tests require GoBGP and root privileges for network namespace setup:
+See [docs/testing.md](docs/testing.md) for details.
 
-```sh
-sudo make test-integration
+## Project Structure
+
+```
+src/
+  main.rs         # CLI (daemon, status, routes subcommands)
+  lib.rs          # Library exports
+  config.rs       # TOML configuration parsing
+  api/            # gRPC server and client
+  bgp/            # BGP protocol implementation
+proto/
+  febgp.proto     # gRPC API definition
+tests-integration/
+  src/            # Integration tests against GoBGP
 ```
 
 ## License

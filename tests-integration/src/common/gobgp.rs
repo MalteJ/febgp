@@ -6,9 +6,9 @@ use std::process::Child;
 
 use super::netns::NetNs;
 
-// Path to gobgp binaries (from tools/ directory)
-const GOBGPD_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/gobgpd");
-const GOBGP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/gobgp");
+// Path to gobgp binaries (from workspace root tools/ directory)
+const GOBGPD_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/gobgpd");
+const GOBGP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/gobgp");
 
 /// Configuration for a GoBGP instance
 pub struct GobgpConfig {
@@ -35,7 +35,7 @@ impl GobgpConfig {
         config.push_str(&format!("  as = {}\n", self.asn));
         config.push_str(&format!("  router-id = \"{}\"\n", self.router_id));
         config.push_str(&format!("  port = {}\n", self.listen_port));
-        config.push_str("\n");
+        config.push('\n');
 
         // Neighbors
         for neighbor in &self.neighbors {
@@ -48,7 +48,7 @@ impl GobgpConfig {
             config.push_str("  [[neighbors.afi-safis]]\n");
             config.push_str("    [neighbors.afi-safis.config]\n");
             config.push_str("      afi-safi-name = \"ipv6-unicast\"\n");
-            config.push_str("\n");
+            config.push('\n');
         }
 
         config
@@ -122,6 +122,7 @@ impl GobgpInstance {
 
     /// Check if any BGP neighbor is established
     /// Session states: 1=Idle, 2=Connect, 3=Active, 4=OpenSent, 5=OpenConfirm, 6=Established
+    #[allow(dead_code)]
     pub fn is_neighbor_established(&self) -> bool {
         if let Ok(output) = self.gobgp(&["neighbor", "-j"]) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output) {
@@ -143,6 +144,7 @@ impl GobgpInstance {
     }
 
     /// Check if a prefix is received from BGP
+    #[allow(dead_code)]
     pub fn has_prefix(&self, prefix: &str) -> bool {
         if let Ok(output) = self.gobgp(&["global", "rib", "-a", "ipv6", "-j"]) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output) {
@@ -156,6 +158,7 @@ impl GobgpInstance {
     }
 
     /// Announce a prefix
+    #[allow(dead_code)]
     pub fn announce_prefix(&self, prefix: &str) -> io::Result<()> {
         self.gobgp(&["global", "rib", "add", prefix, "-a", "ipv6"])?;
         Ok(())
@@ -167,6 +170,7 @@ impl GobgpInstance {
     }
 
     /// Get routes for debugging
+    #[allow(dead_code)]
     pub fn get_routes(&self) -> String {
         self.gobgp(&["global", "rib", "-a", "ipv6"]).unwrap_or_default()
     }

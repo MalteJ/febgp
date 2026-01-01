@@ -1,0 +1,25 @@
+[package]
+name = "tests-integration"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+febgp = { path = ".." }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+libc = { workspace = true }
+
+[[bin]]
+name = "febgp-connect"
+path = "src/bin/febgp_connect.rs"
+
+[[test]]
+name = "gobgp_to_gobgp"
+path = "src/gobgp_to_gobgp.rs"
+harness = true
+
+[[test]]
+name = "febgp_to_gobgp"
+path = "src/febgp_to_gobgp.rs"
+harness = true
