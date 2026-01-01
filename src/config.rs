@@ -20,6 +20,18 @@ pub struct Config {
     /// Default: 30 seconds.
     #[serde(default = "default_connect_retry_time")]
     pub connect_retry_time: u64,
+    /// Enable IPv4 unicast address family.
+    /// Default: false (for BGP unnumbered compatibility).
+    #[serde(default)]
+    pub ipv4_unicast: bool,
+    /// Enable IPv6 unicast address family.
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub ipv6_unicast: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_hold_time() -> u16 {

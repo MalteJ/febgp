@@ -268,6 +268,8 @@ async fn main() -> ExitCode {
         hold_time: 90,
         peer_asn: args.remote_asn,
         connect_retry_time: Duration::from_secs(30),
+        ipv4_unicast: false,
+        ipv6_unicast: true,
     };
 
     // Create transport with link-local address

@@ -217,16 +217,53 @@ impl<T: BgpTransport> SessionActor<T> {
                 self.process_event(FsmEvent::Tcp(TcpEvent::TcpConnectionConfirmed))
                     .await;
             }
-            FsmState::OpenSent | FsmState::OpenConfirm => {
+            FsmState::OpenSent => {
                 // RFC 4271 Section 6.8: Connection Collision Detection
-                // We've sent OPEN on the outbound connection, now have inbound
+                // We've sent OPEN but haven't received peer's OPEN yet.
+                // We don't know their Router ID, so we can't properly resolve.
+                // Per RFC 4271, we should track both connections and resolve
+                // when we receive the OPEN. For simplicity, since our outbound
+                // connection is already in progress, drop the incoming.
+                // The peer will also detect collision and should keep ours
+                // if our Router ID is higher.
+                debug!(
+                    peer = %self.transport.peer_addr(),
+                    "Dropping incoming connection in OpenSent (collision), keeping outbound"
+                );
+                drop(stream);
+            }
+            FsmState::OpenConfirm => {
+                // RFC 4271 Section 6.8: Connection Collision Detection
+                // We've exchanged OPENs, so we know both Router IDs.
                 // Compare BGP Identifiers to decide which to keep:
                 // - If our ID is higher, drop incoming, keep outbound
-                // - If our ID is lower, drop outbound, accept incoming
-                // We don't know their ID yet on the incoming connection,
-                // so we temporarily accept both and let the OPEN comparison decide
-                // For now, drop the incoming since we already sent OPEN on outbound
-                drop(stream);
+                // - If our ID is lower, close outbound, accept incoming
+                let our_id = self.fsm.config().router_id;
+                let peer_id = self.fsm.peer_router_id().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+
+                if our_id > peer_id {
+                    // Our ID is higher - keep our outbound connection
+                    debug!(
+                        peer = %self.transport.peer_addr(),
+                        our_id = %our_id,
+                        peer_id = %peer_id,
+                        "Collision: our Router ID higher, dropping incoming connection"
+                    );
+                    drop(stream);
+                } else {
+                    // Peer's ID is higher - close outbound, accept incoming
+                    debug!(
+                        peer = %self.transport.peer_addr(),
+                        our_id = %our_id,
+                        peer_id = %peer_id,
+                        "Collision: peer Router ID higher, switching to incoming connection"
+                    );
+                    let _ = self.transport.close().await;
+                    self.transport.accept_incoming(stream);
+                    // Re-process as new connection - send OPEN on this connection
+                    self.process_event(FsmEvent::Tcp(TcpEvent::TcpConnectionConfirmed))
+                        .await;
+                }
             }
             FsmState::Established => {
                 // Already have an established session, drop incoming
@@ -335,7 +372,13 @@ impl<T: BgpTransport> SessionActor<T> {
 
             FsmAction::SendOpen => {
                 let config = self.fsm.config();
-                let open = OpenMessage::new(config.local_asn, config.hold_time, config.router_id);
+                let open = OpenMessage::new_with_families(
+                    config.local_asn,
+                    config.hold_time,
+                    config.router_id,
+                    config.ipv4_unicast,
+                    config.ipv6_unicast,
+                );
                 let bytes = open.to_bytes();
                 debug!(
                     peer = %self.transport.peer_addr(),
@@ -526,6 +569,8 @@ mod tests {
             router_id: Ipv4Addr::new(1, 1, 1, 1),
             hold_time: 90,
             connect_retry_time: Duration::from_secs(5),
+            ipv4_unicast: false,
+            ipv6_unicast: true,
         }
     }
 

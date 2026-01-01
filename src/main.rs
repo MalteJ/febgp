@@ -30,6 +30,8 @@ struct PeerSessionContext {
     rib_handle: RibHandle,
     hold_time: u16,
     connect_retry_time: u64,
+    ipv4_unicast: bool,
+    ipv6_unicast: bool,
 }
 
 #[derive(Parser)]
@@ -155,6 +157,8 @@ async fn run_daemon_async(
             rib_handle: rib_handle.clone(),
             hold_time: config.hold_time,
             connect_retry_time: config.connect_retry_time,
+            ipv4_unicast: config.ipv4_unicast,
+            ipv6_unicast: config.ipv6_unicast,
         };
 
         // Create command channel and keep sender for shutdown
@@ -392,6 +396,8 @@ async fn run_peer_session(
         rib_handle,
         hold_time,
         connect_retry_time,
+        ipv4_unicast,
+        ipv6_unicast,
     } = ctx;
 
     // Parse peer address
@@ -412,6 +418,8 @@ async fn run_peer_session(
         hold_time,
         peer_asn: peer.remote_asn.unwrap_or(0), // 0 = accept any (BGP unnumbered)
         connect_retry_time: std::time::Duration::from_secs(connect_retry_time),
+        ipv4_unicast,
+        ipv6_unicast,
     };
 
     // Create transport

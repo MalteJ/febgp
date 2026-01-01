@@ -168,15 +168,26 @@ impl Capability {
 }
 
 impl OpenMessage {
-    pub fn new(asn: u32, hold_time: u16, router_id: Ipv4Addr) -> Self {
-        let capabilities = vec![
-            // IPv4 unicast (AFI=1, SAFI=1)
-            Capability::MultiProtocol { afi: 1, safi: 1 },
-            // IPv6 unicast (AFI=2, SAFI=1)
-            Capability::MultiProtocol { afi: 2, safi: 1 },
-            // 4-octet AS support
-            Capability::FourOctetAs { asn },
-        ];
+    /// Create a new OPEN message with specified address families.
+    pub fn new_with_families(
+        asn: u32,
+        hold_time: u16,
+        router_id: Ipv4Addr,
+        ipv4_unicast: bool,
+        ipv6_unicast: bool,
+    ) -> Self {
+        let mut capabilities = Vec::new();
+
+        // Add address family capabilities
+        if ipv4_unicast {
+            capabilities.push(Capability::MultiProtocol { afi: 1, safi: 1 });
+        }
+        if ipv6_unicast {
+            capabilities.push(Capability::MultiProtocol { afi: 2, safi: 1 });
+        }
+
+        // 4-octet AS support
+        capabilities.push(Capability::FourOctetAs { asn });
 
         Self {
             version: BGP_VERSION,
@@ -185,6 +196,11 @@ impl OpenMessage {
             router_id,
             capabilities,
         }
+    }
+
+    /// Create a new OPEN message with default address families (IPv6 only for BGP unnumbered).
+    pub fn new(asn: u32, hold_time: u16, router_id: Ipv4Addr) -> Self {
+        Self::new_with_families(asn, hold_time, router_id, false, true)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -526,8 +542,8 @@ mod tests {
         assert_eq!(open.asn, 65001);
         assert_eq!(open.hold_time, 180);
         assert_eq!(open.router_id, Ipv4Addr::new(1, 2, 3, 4));
-        // IPv4 unicast + IPv6 unicast + FourOctetAs
-        assert_eq!(open.capabilities.len(), 3);
+        // IPv6 unicast + FourOctetAs (default is IPv6 only for BGP unnumbered)
+        assert_eq!(open.capabilities.len(), 2);
     }
 
     #[test]

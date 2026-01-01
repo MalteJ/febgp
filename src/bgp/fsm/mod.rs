@@ -36,6 +36,10 @@ pub struct FsmConfig {
     pub hold_time: u16,
     /// Time between connection retry attempts.
     pub connect_retry_time: Duration,
+    /// Enable IPv4 unicast address family.
+    pub ipv4_unicast: bool,
+    /// Enable IPv6 unicast address family.
+    pub ipv6_unicast: bool,
 }
 
 impl Default for FsmConfig {
@@ -46,6 +50,8 @@ impl Default for FsmConfig {
             router_id: Ipv4Addr::new(0, 0, 0, 1),
             hold_time: 90,
             connect_retry_time: Duration::from_secs(120),
+            ipv4_unicast: false,
+            ipv6_unicast: true,
         }
     }
 }
@@ -574,6 +580,8 @@ mod tests {
             router_id: Ipv4Addr::new(1, 1, 1, 1),
             hold_time: 90,
             connect_retry_time: Duration::from_secs(120),
+            ipv4_unicast: false,
+            ipv6_unicast: true,
         }
     }
 
