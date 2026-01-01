@@ -13,7 +13,7 @@ use tonic::transport::Server;
 use febgp::api;
 use febgp::api::server::{DaemonState, FebgpServiceImpl, NeighborState};
 use febgp::{FebgpServiceServer, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH};
-use febgp::bgp::{self, parse_update, FsmConfig, FsmState, SessionActor, SessionCommand, SessionEvent, TcpTransport};
+use febgp::bgp::{self, build_ipv4_update, build_ipv6_update, parse_update, FsmConfig, FsmState, SessionActor, SessionCommand, SessionEvent, TcpTransport};
 use febgp::config::{Config, PeerConfig};
 
 #[derive(Parser)]
@@ -108,9 +108,10 @@ async fn run_daemon_async(
         let local_asn = config.asn;
         let router_id = config.router_id;
         let peer_config = peer.clone();
+        let prefixes = config.prefixes.clone();
 
         tokio::spawn(async move {
-            run_peer_session(peer_idx, peer_config, local_asn, router_id, state_clone, install_routes).await;
+            run_peer_session(peer_idx, peer_config, local_asn, router_id, state_clone, install_routes, prefixes).await;
         });
     }
 
@@ -250,6 +251,7 @@ async fn run_peer_session(
     router_id: std::net::Ipv4Addr,
     state: Arc<RwLock<DaemonState>>,
     install_routes: bool,
+    prefixes: Vec<String>,
 ) {
     // Parse peer address
     let peer_addr = match parse_peer_address(&peer) {
@@ -310,6 +312,27 @@ async fn run_peer_session(
                     "Peer {} (AS{}) router-id: {}",
                     peer_addr, peer_asn, peer_router_id
                 );
+
+                // Announce configured prefixes
+                for prefix in &prefixes {
+                    let update_body = if prefix.contains(':') {
+                        // IPv6 prefix
+                        build_ipv6_update(prefix, local_asn)
+                    } else {
+                        // IPv4 prefix
+                        build_ipv4_update(prefix, local_asn)
+                    };
+
+                    if let Some(body) = update_body {
+                        if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
+                            eprintln!("Failed to send UPDATE for {}: {}", prefix, e);
+                        } else {
+                            println!("Announced prefix {} to {}", prefix, peer_addr);
+                        }
+                    } else {
+                        eprintln!("Failed to build UPDATE for prefix: {}", prefix);
+                    }
+                }
             }
             SessionEvent::SessionDown { reason } => {
                 println!("Session to {} went down: {}", peer_addr, reason);

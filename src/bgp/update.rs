@@ -1,4 +1,4 @@
-//! BGP UPDATE message parsing.
+//! BGP UPDATE message parsing and building.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -306,6 +306,132 @@ fn parse_ipv6_nlri(data: &[u8]) -> Vec<String> {
     }
 
     prefixes
+}
+
+/// Build a BGP UPDATE message body for an IPv4 prefix using MP_REACH_NLRI.
+/// Returns the UPDATE body (not including BGP header).
+pub fn build_ipv4_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
+    let parts: Vec<&str> = prefix_str.split('/').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let addr: Ipv4Addr = parts[0].parse().ok()?;
+    let prefix_len: u8 = parts[1].parse().ok()?;
+
+    let mut update = Vec::new();
+
+    // Withdrawn Routes Length (0)
+    update.extend_from_slice(&0u16.to_be_bytes());
+
+    // Build path attributes
+    #[rustfmt::skip]
+    let mut path_attrs = vec![
+        // ORIGIN (type 1) - IGP
+        0x40, // Transitive
+        1,    // ORIGIN
+        1,    // Length
+        0,    // IGP
+        // AS_PATH (type 2) - AS_SEQUENCE with our ASN
+        0x40, // Transitive
+        2,    // AS_PATH
+        6,    // Length (1 + 1 + 4)
+        2,    // AS_SEQUENCE
+        1,    // 1 ASN
+    ];
+    path_attrs.extend_from_slice(&local_asn.to_be_bytes());
+
+    // MP_REACH_NLRI (type 14) for IPv4
+    let mut mp_reach = Vec::new();
+    mp_reach.extend_from_slice(&1u16.to_be_bytes()); // AFI = 1 (IPv4)
+    mp_reach.push(1); // SAFI = 1 (unicast)
+
+    // Next hop - 4 bytes for IPv4
+    mp_reach.push(4); // Next hop length
+    // Use a placeholder next-hop (0.0.0.0) - the peer should determine the correct next-hop
+    mp_reach.extend_from_slice(&[0, 0, 0, 0]);
+
+    mp_reach.push(0); // Reserved
+
+    // NLRI
+    mp_reach.push(prefix_len);
+    let bytes_needed = prefix_len.div_ceil(8) as usize;
+    mp_reach.extend_from_slice(&addr.octets()[..bytes_needed]);
+
+    // Add MP_REACH_NLRI attribute (optional, transitive, extended length)
+    path_attrs.push(0x90); // Optional + Transitive + Extended length
+    path_attrs.push(14); // MP_REACH_NLRI
+    path_attrs.extend_from_slice(&(mp_reach.len() as u16).to_be_bytes());
+    path_attrs.extend(mp_reach);
+
+    // Total Path Attribute Length
+    update.extend_from_slice(&(path_attrs.len() as u16).to_be_bytes());
+    update.extend(path_attrs);
+
+    Some(update)
+}
+
+/// Build a BGP UPDATE message body for an IPv6 prefix using MP_REACH_NLRI.
+/// Returns the UPDATE body (not including BGP header).
+pub fn build_ipv6_update(prefix_str: &str, local_asn: u32) -> Option<Vec<u8>> {
+    let parts: Vec<&str> = prefix_str.split('/').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let addr: Ipv6Addr = parts[0].parse().ok()?;
+    let prefix_len: u8 = parts[1].parse().ok()?;
+
+    let mut update = Vec::new();
+
+    // Withdrawn Routes Length (0)
+    update.extend_from_slice(&0u16.to_be_bytes());
+
+    // Build path attributes
+    #[rustfmt::skip]
+    let mut path_attrs = vec![
+        // ORIGIN (type 1) - IGP
+        0x40, // Transitive
+        1,    // ORIGIN
+        1,    // Length
+        0,    // IGP
+        // AS_PATH (type 2) - AS_SEQUENCE with our ASN
+        0x40, // Transitive
+        2,    // AS_PATH
+        6,    // Length
+        2,    // AS_SEQUENCE
+        1,    // 1 ASN
+    ];
+    path_attrs.extend_from_slice(&local_asn.to_be_bytes());
+
+    // MP_REACH_NLRI (type 14) for IPv6
+    let mut mp_reach = Vec::new();
+    mp_reach.extend_from_slice(&2u16.to_be_bytes()); // AFI = 2 (IPv6)
+    mp_reach.push(1); // SAFI = 1 (unicast)
+
+    // Next hop - use link-local placeholder (fe80::1)
+    let next_hop: Ipv6Addr = "fe80::1".parse().unwrap();
+    mp_reach.push(16); // Next hop length (16 bytes for single IPv6)
+    mp_reach.extend_from_slice(&next_hop.octets());
+
+    mp_reach.push(0); // Reserved
+
+    // NLRI
+    mp_reach.push(prefix_len);
+    let bytes_needed = prefix_len.div_ceil(8) as usize;
+    mp_reach.extend_from_slice(&addr.octets()[..bytes_needed]);
+
+    // Add MP_REACH_NLRI attribute (optional, transitive, extended length)
+    path_attrs.push(0x90); // Optional + Transitive + Extended length
+    path_attrs.push(14); // MP_REACH_NLRI
+    path_attrs.extend_from_slice(&(mp_reach.len() as u16).to_be_bytes());
+    path_attrs.extend(mp_reach);
+
+    // Total Path Attribute Length
+    update.extend_from_slice(&(path_attrs.len() as u16).to_be_bytes());
+    update.extend(path_attrs);
+
+    Some(update)
 }
 
 #[cfg(test)]

@@ -2162,3 +2162,134 @@ remote_asn = 65003
 
     println!("Upgrade to ECMP test passed!");
 }
+
+/// Test that GoBGP receives routes announced by the FeBGP daemon.
+///
+/// This test verifies the full route announcement flow:
+/// 1. FeBGP daemon starts with configured prefixes
+/// 2. Session is established with GoBGP
+/// 3. FeBGP announces its configured prefixes
+/// 4. GoBGP receives and stores the routes in its RIB
+#[test]
+fn test_gobgp_receives_routes_from_febgp_daemon() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create two network namespaces
+    let ns1 = NetNs::new("febgp_test_ann1").expect("Failed to create namespace");
+    let ns2 = NetNs::new("febgp_test_ann2").expect("Failed to create namespace");
+
+    // Create a veth pair between them
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair");
+
+    // Wait for DAD to complete
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+
+    // Configure GoBGP (will receive routes from FeBGP)
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start GoBGP
+    let gobgp2 = GobgpInstance::start(&ns2, &config2, 50070).expect("Failed to start GoBGP");
+
+    // Give GoBGP time to start
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Create FeBGP config with prefixes to announce
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_ann_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_ann_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = ["10.99.0.0/24", "10.99.1.0/24", "2001:db8:99::/48"]
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+"#,
+            addr2
+        ),
+    )
+    .expect("Failed to write config");
+
+    // Start FeBGP daemon
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon",
+            "-c",
+            &config_path,
+            "--socket",
+            &socket_path,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for session to establish and routes to be announced
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Check if GoBGP received the IPv4 routes
+    let gobgp_routes_v4 = gobgp2.get_routes_v4();
+    println!("GoBGP IPv4 RIB:\n{}", gobgp_routes_v4);
+
+    let has_route_v4_1 = gobgp2.has_prefix_v4("10.99.0.0/24");
+    let has_route_v4_2 = gobgp2.has_prefix_v4("10.99.1.0/24");
+
+    // Check if GoBGP received the IPv6 route
+    let gobgp_routes_v6 = gobgp2.get_routes();
+    println!("GoBGP IPv6 RIB:\n{}", gobgp_routes_v6);
+
+    let has_route_v6 = gobgp2.has_prefix("2001:db8:99::/48");
+
+    // Show neighbor summary for debugging
+    println!("GoBGP neighbor summary:\n{}", gobgp2.get_neighbor_summary());
+
+    // Kill daemon and clean up
+    let _ = daemon.kill();
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Verify routes
+    assert!(
+        has_route_v4_1,
+        "GoBGP did not receive IPv4 prefix 10.99.0.0/24 from FeBGP. Routes:\n{}",
+        gobgp_routes_v4
+    );
+    assert!(
+        has_route_v4_2,
+        "GoBGP did not receive IPv4 prefix 10.99.1.0/24 from FeBGP. Routes:\n{}",
+        gobgp_routes_v4
+    );
+    assert!(
+        has_route_v6,
+        "GoBGP did not receive IPv6 prefix 2001:db8:99::/48 from FeBGP. Routes:\n{}",
+        gobgp_routes_v6
+    );
+
+    println!("GoBGP receives routes from FeBGP daemon test passed!");
+}
