@@ -18,9 +18,6 @@ use crate::bgp::message::{KeepaliveMessage, Message, OpenMessage};
 use crate::bgp::transport::{BgpTransport, TransportError};
 
 /// Commands that can be sent to the session actor.
-///
-/// The `Stop` variant is used in tests; production use is planned.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum SessionCommand {
     /// Start the BGP session.

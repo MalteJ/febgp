@@ -1,4 +1,4 @@
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -14,7 +14,17 @@ use febgp::api;
 use febgp::api::server::{DaemonState, FebgpServiceImpl, NeighborState};
 use febgp::{FebgpServiceServer, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH};
 use febgp::bgp::{self, build_ipv4_update, build_ipv6_update, parse_update, FsmConfig, FsmState, SessionActor, SessionCommand, SessionEvent, TcpTransport};
-use febgp::config::{Config, PeerConfig};
+use febgp::config::{parse_peer_address, Config, PeerConfig};
+
+/// Context for running a peer session.
+struct PeerSessionContext {
+    peer_idx: usize,
+    peer: PeerConfig,
+    local_asn: u32,
+    router_id: Ipv4Addr,
+    state: Arc<RwLock<DaemonState>>,
+    prefixes: Vec<String>,
+}
 
 #[derive(Parser)]
 #[command(name = "febgp")]
@@ -109,16 +119,26 @@ async fn run_daemon_async(
         }
     }
 
+    // Track command senders for graceful shutdown
+    let mut session_senders: Vec<mpsc::Sender<SessionCommand>> = Vec::new();
+
     // Spawn BGP sessions for each peer
     for (peer_idx, peer) in config.peers.iter().enumerate() {
-        let state_clone = Arc::clone(&state);
-        let local_asn = config.asn;
-        let router_id = config.router_id;
-        let peer_config = peer.clone();
-        let prefixes = config.prefixes.clone();
+        let ctx = PeerSessionContext {
+            peer_idx,
+            peer: peer.clone(),
+            local_asn: config.asn,
+            router_id: config.router_id,
+            state: Arc::clone(&state),
+            prefixes: config.prefixes.clone(),
+        };
+
+        // Create command channel and keep sender for shutdown
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(16);
+        session_senders.push(cmd_tx.clone());
 
         tokio::spawn(async move {
-            run_peer_session(peer_idx, peer_config, local_asn, router_id, state_clone, prefixes).await;
+            run_peer_session(ctx, cmd_tx, cmd_rx).await;
         });
     }
 
@@ -138,9 +158,30 @@ async fn run_daemon_async(
 
     println!("  gRPC server listening on {}", socket_path);
 
+    // Set up signal handlers for graceful shutdown
+    let shutdown_senders = session_senders.clone();
+    let shutdown_handle = tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        println!("\nReceived shutdown signal, stopping BGP sessions...");
+
+        // Send Stop command to all sessions
+        for (idx, sender) in shutdown_senders.iter().enumerate() {
+            if let Err(e) = sender.send(SessionCommand::Stop).await {
+                eprintln!("Failed to send stop to session {}: {}", idx, e);
+            }
+        }
+
+        // Give sessions time to send NOTIFICATION and close cleanly
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        println!("Shutdown complete");
+    });
+
+    // Run gRPC server with graceful shutdown
     Server::builder()
         .add_service(FebgpServiceServer::new(service))
-        .serve_with_incoming(uds_stream)
+        .serve_with_incoming_shutdown(uds_stream, async {
+            shutdown_handle.await.ok();
+        })
         .await?;
 
     Ok(())
@@ -250,15 +291,37 @@ fn show_routes(socket_path: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Wait for shutdown signal (SIGTERM or SIGINT/Ctrl+C).
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+
+    tokio::select! {
+        _ = sigterm.recv() => {},
+        _ = sigint.recv() => {},
+    }
+}
+
 /// Run a BGP session for a single peer.
+///
+/// Takes externally created channels to allow the caller to keep a reference
+/// to the command sender for graceful shutdown.
 async fn run_peer_session(
-    peer_idx: usize,
-    peer: PeerConfig,
-    local_asn: u32,
-    router_id: std::net::Ipv4Addr,
-    state: Arc<RwLock<DaemonState>>,
-    prefixes: Vec<String>,
+    ctx: PeerSessionContext,
+    cmd_tx: mpsc::Sender<SessionCommand>,
+    cmd_rx: mpsc::Receiver<SessionCommand>,
 ) {
+    let PeerSessionContext {
+        peer_idx,
+        peer,
+        local_asn,
+        router_id,
+        state,
+        prefixes,
+    } = ctx;
+
     // Parse peer address
     let peer_addr = match parse_peer_address(&peer) {
         Ok(addr) => addr,
@@ -282,8 +345,7 @@ async fn run_peer_session(
     // Create transport
     let transport = TcpTransport::new(peer_addr);
 
-    // Create channels for commands and events
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(16);
+    // Create event channel
     let (event_tx, mut event_rx) = mpsc::channel::<SessionEvent>(16);
 
     // Create and spawn the session actor
@@ -395,41 +457,6 @@ async fn run_peer_session(
             update_uptime(&state, peer_idx, started.elapsed().as_secs()).await;
         }
     }
-}
-
-/// Parse peer address from configuration.
-fn parse_peer_address(peer: &PeerConfig) -> Result<SocketAddr, String> {
-    const BGP_PORT: u16 = 179;
-
-    if let Some(addr_str) = &peer.address {
-        // Explicit address provided
-        if let Ok(addr) = addr_str.parse::<std::net::IpAddr>() {
-            return Ok(SocketAddr::new(addr, BGP_PORT));
-        }
-
-        // Try parsing as IPv6 with scope ID (fe80::1%eth0 format)
-        if let Some((ip_part, scope_part)) = addr_str.split_once('%') {
-            let ip: Ipv6Addr = ip_part
-                .parse()
-                .map_err(|e| format!("Invalid IPv6 address: {}", e))?;
-            let scope_id = get_interface_index(scope_part)
-                .ok_or_else(|| format!("Unknown interface: {}", scope_part))?;
-            return Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
-                ip, BGP_PORT, 0, scope_id,
-            )));
-        }
-
-        return Err(format!("Invalid address format: {}", addr_str));
-    }
-
-    // No address specified - for now, require explicit address
-    // TODO: Implement neighbor discovery for link-local peering
-    Err("No peer address specified and neighbor discovery not yet implemented".to_string())
-}
-
-/// Get interface index by name.
-fn get_interface_index(name: &str) -> Option<u32> {
-    nix::net::if_::if_nametoindex(name).ok()
 }
 
 /// Update peer state in shared daemon state.
