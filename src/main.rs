@@ -81,11 +81,18 @@ async fn run_daemon_async(
         println!("  Route installation: enabled");
     }
 
-    // Create shared state
-    let state = Arc::new(RwLock::new(DaemonState::new(
-        config.asn,
-        config.router_id.to_string(),
-    )));
+    // Create shared state (with netlink handle if route installation is enabled)
+    let state = if install_routes {
+        Arc::new(RwLock::new(
+            DaemonState::with_netlink(config.asn, config.router_id.to_string())
+                .map_err(|e| format!("Failed to create netlink connection: {}", e))?,
+        ))
+    } else {
+        Arc::new(RwLock::new(DaemonState::new(
+            config.asn,
+            config.router_id.to_string(),
+        )))
+    };
 
     // Initialize neighbor states
     {
@@ -111,7 +118,7 @@ async fn run_daemon_async(
         let prefixes = config.prefixes.clone();
 
         tokio::spawn(async move {
-            run_peer_session(peer_idx, peer_config, local_asn, router_id, state_clone, install_routes, prefixes).await;
+            run_peer_session(peer_idx, peer_config, local_asn, router_id, state_clone, prefixes).await;
         });
     }
 
@@ -250,7 +257,6 @@ async fn run_peer_session(
     local_asn: u32,
     router_id: std::net::Ipv4Addr,
     state: Arc<RwLock<DaemonState>>,
-    install_routes: bool,
     prefixes: Vec<String>,
 ) {
     // Parse peer address
@@ -340,7 +346,7 @@ async fn run_peer_session(
                 // Remove all routes from this peer
                 {
                     let mut s = state.write().await;
-                    let removed = s.rib.remove_peer_routes(peer_idx, install_routes).await;
+                    let removed = s.rib.remove_peer_routes(peer_idx).await;
                     if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
                         neighbor.prefixes_received = 0;
                     }
@@ -366,7 +372,7 @@ async fn run_peer_session(
 
                 for route in routes {
                     let mut s = state.write().await;
-                    s.rib.add_route(peer_idx, route, &interface, install_routes).await;
+                    s.rib.add_route(peer_idx, route, &interface).await;
                 }
 
                 // Update prefix count

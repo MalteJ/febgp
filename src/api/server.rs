@@ -34,6 +34,19 @@ impl DaemonState {
             rib: Rib::new(),
         }
     }
+
+    /// Create a new DaemonState with route installation enabled.
+    ///
+    /// This establishes a persistent netlink connection that will be reused
+    /// for all route install/remove operations.
+    pub fn with_netlink(asn: u32, router_id: String) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
+            asn,
+            router_id,
+            neighbors: Vec::new(),
+            rib: Rib::with_netlink()?,
+        })
+    }
 }
 
 /// gRPC service implementation

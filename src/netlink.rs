@@ -27,72 +27,87 @@ use rtnetlink::Handle;
 /// Protocol ID for BGP routes (186 = BGP per IANA)
 const RTPROT_BGP: RouteProtocol = RouteProtocol::Other(186);
 
-/// Install a route into the Linux routing table.
+/// A reusable netlink connection handle for route operations.
 ///
-/// Supports:
-/// - IPv4 prefix with IPv4 gateway
-/// - IPv6 prefix with IPv6 gateway
-/// - IPv4 prefix with IPv6 gateway (RFC 5549, BGP unnumbered) - requires interface
-pub async fn install_route(prefix: &str, next_hop: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let (connection, handle, _) = rtnetlink::new_connection()?;
-    tokio::spawn(connection);
-
-    let (dest, prefix_len) = parse_prefix(prefix)?;
-    let (gateway, interface) = parse_next_hop_with_interface(next_hop)?;
-
-    match (dest, gateway) {
-        (IpAddr::V4(dest), IpAddr::V4(gw)) => {
-            install_route_v4(&handle, dest, prefix_len, gw).await?;
-        }
-        (IpAddr::V6(dest), IpAddr::V6(gw)) => {
-            install_route_v6(&handle, dest, prefix_len, gw).await?;
-        }
-        (IpAddr::V4(dest), IpAddr::V6(gw)) => {
-            // IPv4 over IPv6 next-hop (RFC 5549) - requires interface
-            if let Some(if_name) = interface {
-                install_route_v4_via_v6(&handle, dest, prefix_len, gw, &if_name).await?;
-            } else {
-                return Err("IPv4 route with IPv6 next-hop requires interface (e.g., fe80::1%eth0)".into());
-            }
-        }
-        (IpAddr::V6(_), IpAddr::V4(_)) => {
-            return Err("IPv6 route with IPv4 next-hop is not supported".into());
-        }
-    }
-
-    Ok(())
+/// This struct maintains a persistent connection to the netlink socket,
+/// allowing multiple route operations to be performed without the overhead
+/// of creating a new connection for each operation.
+pub struct NetlinkHandle {
+    handle: Handle,
 }
 
-/// Remove a route from the Linux routing table.
-pub async fn remove_route(prefix: &str, next_hop: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let (connection, handle, _) = rtnetlink::new_connection()?;
-    tokio::spawn(connection);
-
-    let (dest, prefix_len) = parse_prefix(prefix)?;
-    let (gateway, interface) = parse_next_hop_with_interface(next_hop)?;
-
-    match (dest, gateway) {
-        (IpAddr::V4(dest), IpAddr::V4(gw)) => {
-            remove_route_v4(&handle, dest, prefix_len, gw).await?;
-        }
-        (IpAddr::V6(dest), IpAddr::V6(gw)) => {
-            remove_route_v6(&handle, dest, prefix_len, gw).await?;
-        }
-        (IpAddr::V4(dest), IpAddr::V6(gw)) => {
-            // IPv4 via IPv6 removal - need next-hop and interface for ECMP
-            if let Some(ref if_name) = interface {
-                remove_route_v4_via_v6(&handle, dest, prefix_len, gw, if_name).await?;
-            } else {
-                // Fallback: remove by prefix only (removes all matching routes)
-                remove_route_v4_any(&handle, dest, prefix_len).await?;
-            }
-        }
-        _ => {
-            return Err("Address family mismatch not supported for removal".into());
-        }
+impl NetlinkHandle {
+    /// Create a new netlink handle.
+    ///
+    /// This establishes a connection to the netlink socket and spawns
+    /// the connection task in the background.
+    pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let (connection, handle, _) = rtnetlink::new_connection()?;
+        tokio::spawn(connection);
+        Ok(Self { handle })
     }
 
-    Ok(())
+    /// Install a route into the Linux routing table.
+    ///
+    /// Supports:
+    /// - IPv4 prefix with IPv4 gateway
+    /// - IPv6 prefix with IPv6 gateway
+    /// - IPv4 prefix with IPv6 gateway (RFC 5549, BGP unnumbered) - requires interface
+    pub async fn install_route(&self, prefix: &str, next_hop: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (dest, prefix_len) = parse_prefix(prefix)?;
+        let (gateway, interface) = parse_next_hop_with_interface(next_hop)?;
+
+        match (dest, gateway) {
+            (IpAddr::V4(dest), IpAddr::V4(gw)) => {
+                install_route_v4(&self.handle, dest, prefix_len, gw).await?;
+            }
+            (IpAddr::V6(dest), IpAddr::V6(gw)) => {
+                install_route_v6(&self.handle, dest, prefix_len, gw).await?;
+            }
+            (IpAddr::V4(dest), IpAddr::V6(gw)) => {
+                // IPv4 over IPv6 next-hop (RFC 5549) - requires interface
+                if let Some(if_name) = interface {
+                    install_route_v4_via_v6(&self.handle, dest, prefix_len, gw, &if_name).await?;
+                } else {
+                    return Err("IPv4 route with IPv6 next-hop requires interface (e.g., fe80::1%eth0)".into());
+                }
+            }
+            (IpAddr::V6(_), IpAddr::V4(_)) => {
+                return Err("IPv6 route with IPv4 next-hop is not supported".into());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove a route from the Linux routing table.
+    pub async fn remove_route(&self, prefix: &str, next_hop: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (dest, prefix_len) = parse_prefix(prefix)?;
+        let (gateway, interface) = parse_next_hop_with_interface(next_hop)?;
+
+        match (dest, gateway) {
+            (IpAddr::V4(dest), IpAddr::V4(gw)) => {
+                remove_route_v4(&self.handle, dest, prefix_len, gw).await?;
+            }
+            (IpAddr::V6(dest), IpAddr::V6(gw)) => {
+                remove_route_v6(&self.handle, dest, prefix_len, gw).await?;
+            }
+            (IpAddr::V4(dest), IpAddr::V6(gw)) => {
+                // IPv4 via IPv6 removal - need next-hop and interface for ECMP
+                if let Some(ref if_name) = interface {
+                    remove_route_v4_via_v6(&self.handle, dest, prefix_len, gw, if_name).await?;
+                } else {
+                    // Fallback: remove by prefix only (removes all matching routes)
+                    remove_route_v4_any(&self.handle, dest, prefix_len).await?;
+                }
+            }
+            _ => {
+                return Err("Address family mismatch not supported for removal".into());
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Install IPv4 route with IPv4 gateway.

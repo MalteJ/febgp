@@ -6,7 +6,7 @@
 //! - Kernel route installation via netlink
 
 use crate::bgp::ParsedRoute;
-use crate::netlink;
+use crate::netlink::NetlinkHandle;
 
 /// A route entry in the RIB.
 #[derive(Debug, Clone)]
@@ -21,14 +21,44 @@ pub struct RouteEntry {
 }
 
 /// The Routing Information Base.
-#[derive(Debug, Default)]
 pub struct Rib {
     routes: Vec<RouteEntry>,
+    /// Reusable netlink handle for route installation (None if route installation disabled)
+    netlink: Option<NetlinkHandle>,
+}
+
+impl Default for Rib {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for Rib {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rib")
+            .field("routes", &self.routes)
+            .field("netlink", &self.netlink.is_some())
+            .finish()
+    }
 }
 
 impl Rib {
     pub fn new() -> Self {
-        Self { routes: Vec::new() }
+        Self {
+            routes: Vec::new(),
+            netlink: None,
+        }
+    }
+
+    /// Create a new RIB with route installation enabled.
+    ///
+    /// This establishes a persistent netlink connection that will be reused
+    /// for all route install/remove operations.
+    pub fn with_netlink() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
+            routes: Vec::new(),
+            netlink: Some(NetlinkHandle::new()?),
+        })
     }
 
     /// Get all routes.
@@ -48,6 +78,9 @@ impl Rib {
 
     /// Add or update a route from a peer.
     ///
+    /// If the RIB was created with `with_netlink()`, routes will be automatically
+    /// installed/removed from the kernel.
+    ///
     /// Returns the routes that need to be installed/removed from the kernel:
     /// - `to_install`: Routes that are now best but weren't before
     /// - `to_remove`: Routes that were best but aren't anymore
@@ -56,7 +89,6 @@ impl Rib {
         peer_idx: usize,
         route: ParsedRoute,
         interface: &str,
-        install_routes: bool,
     ) -> (Vec<(String, String)>, Vec<(String, String)>) {
         let as_path_str = route
             .as_path
@@ -126,16 +158,16 @@ impl Rib {
             .cloned()
             .collect();
 
-        // Apply kernel route changes
-        if install_routes {
+        // Apply kernel route changes using the reusable netlink handle
+        if let Some(ref netlink) = self.netlink {
             for (prefix, next_hop) in &to_install {
-                if let Err(e) = netlink::install_route(prefix, next_hop).await {
+                if let Err(e) = netlink.install_route(prefix, next_hop).await {
                     eprintln!("Failed to install route {}: {}", prefix, e);
                 }
             }
 
             for (prefix, next_hop) in &to_remove {
-                if let Err(e) = netlink::remove_route(prefix, next_hop).await {
+                if let Err(e) = netlink.remove_route(prefix, next_hop).await {
                     eprintln!("Failed to remove route {}: {}", prefix, e);
                 }
             }
@@ -146,8 +178,11 @@ impl Rib {
 
     /// Remove all routes from a peer (called when session goes down).
     ///
+    /// If the RIB was created with `with_netlink()`, routes will be automatically
+    /// removed from the kernel and failover routes will be installed.
+    ///
     /// Returns the number of routes removed.
-    pub async fn remove_peer_routes(&mut self, peer_idx: usize, install_routes: bool) -> usize {
+    pub async fn remove_peer_routes(&mut self, peer_idx: usize) -> usize {
         // Collect routes to remove and affected prefixes
         let routes_to_remove: Vec<(String, String, bool)> = self
             .routes
@@ -182,11 +217,11 @@ impl Rib {
         for prefix in &affected_prefixes {
             recalculate_best_paths(&mut self.routes, prefix);
 
-            if install_routes {
+            if let Some(ref netlink) = self.netlink {
                 // Remove routes from this peer that were best
                 for (p, nh, was_best) in &routes_to_remove {
                     if p == prefix && *was_best {
-                        if let Err(e) = netlink::remove_route(p, nh).await {
+                        if let Err(e) = netlink.remove_route(p, nh).await {
                             eprintln!("Failed to remove route {}: {}", p, e);
                         }
                     }
@@ -203,7 +238,7 @@ impl Rib {
                 let previously_best = remaining_best_before.get(prefix).cloned().unwrap_or_default();
                 for next_hop in &currently_best {
                     if !previously_best.contains(next_hop) {
-                        if let Err(e) = netlink::install_route(prefix, next_hop).await {
+                        if let Err(e) = netlink.install_route(prefix, next_hop).await {
                             eprintln!("Failed to install failover route {}: {}", prefix, e);
                         }
                     }
