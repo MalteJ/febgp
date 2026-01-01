@@ -8,7 +8,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use tracing::{debug, error, info, warn};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
@@ -33,6 +33,7 @@ struct PeerSessionContext {
     connect_retry_time: u64,
     ipv4_unicast: bool,
     ipv6_unicast: bool,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 #[derive(Parser)]
@@ -150,6 +151,9 @@ async fn run_daemon_async(
     // Channel for neighbor discovery events
     let (neighbor_tx, mut neighbor_rx) = mpsc::channel::<NeighborEvent>(32);
 
+    // Shutdown signal - broadcast to all peer sessions
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     // Store peer configs for interfaces awaiting neighbor discovery
     // Maps interface name to (peer_idx, peer_config)
     let mut discovery_peers: HashMap<String, (usize, PeerConfig)> = HashMap::new();
@@ -172,6 +176,7 @@ async fn run_daemon_async(
                     connect_retry_time: config.connect_retry_time,
                     ipv4_unicast: config.ipv4_unicast,
                     ipv6_unicast: config.ipv6_unicast,
+                    shutdown_rx: shutdown_rx.clone(),
                 };
 
                 // Create command channel and keep sender for shutdown
@@ -237,6 +242,7 @@ async fn run_daemon_async(
     let neighbor_config_connect_retry_time = config.connect_retry_time;
     let neighbor_config_ipv4_unicast = config.ipv4_unicast;
     let neighbor_config_ipv6_unicast = config.ipv6_unicast;
+    let neighbor_shutdown_rx = shutdown_rx.clone();
 
     // Spawn task to handle discovered neighbors
     tokio::spawn(async move {
@@ -284,6 +290,7 @@ async fn run_daemon_async(
                             connect_retry_time: neighbor_config_connect_retry_time,
                             ipv4_unicast: neighbor_config_ipv4_unicast,
                             ipv6_unicast: neighbor_config_ipv6_unicast,
+                            shutdown_rx: neighbor_shutdown_rx.clone(),
                         };
 
                         // Create command channel
@@ -356,6 +363,9 @@ async fn run_daemon_async(
     let shutdown_handle = tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         info!("Received shutdown signal, stopping BGP sessions...");
+
+        // Signal shutdown to all peer sessions (prevents reconnection attempts)
+        let _ = shutdown_tx.send(true);
 
         // Send Stop command to all sessions
         let senders = shutdown_senders.read().await;
@@ -531,6 +541,7 @@ async fn run_peer_session(
         connect_retry_time,
         ipv4_unicast,
         ipv6_unicast,
+        shutdown_rx,
     } = ctx;
 
     // Get peer address - either passed in or parsed from config
@@ -645,11 +656,19 @@ async fn run_peer_session(
                 }
                 established_at = None;
 
-                // Automatic reconnection after a short delay
+                // Automatic reconnection after a short delay (unless shutting down)
                 let cmd_tx_clone = cmd_tx.clone();
+                let shutdown_rx_clone = shutdown_rx.clone();
                 tokio::spawn(async move {
                     // Wait before attempting reconnection (avoids tight reconnect loop)
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                    // Skip reconnection if shutdown is in progress
+                    if *shutdown_rx_clone.borrow() {
+                        debug!(peer = %peer_addr, "Skipping reconnect due to shutdown");
+                        return;
+                    }
+
                     debug!(peer = %peer_addr, "Attempting to reconnect to peer...");
                     match cmd_tx_clone.send(SessionCommand::Start).await {
                         Ok(()) => debug!(peer = %peer_addr, "Reconnect command sent to {}", peer_addr),

@@ -12,7 +12,7 @@ mod common;
 
 use std::io::{BufRead, BufReader};
 use std::net::Ipv4Addr;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Child, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -271,8 +271,10 @@ fn start_febgp_in_namespace(
     event_tx: mpsc::Sender<String>,
 ) -> std::io::Result<FebgpProcess> {
     // Use sh -c to properly pass environment variables through ip netns exec
+    // Redirect stderr to stdout (2>&1) so we capture all output through stdout pipe
+    // This avoids buffering issues with stderr when not connected to a tty
     let cmd = format!(
-        "RUST_LOG=info {} daemon --config {} --socket {}",
+        "RUST_LOG=info {} daemon --config {} --socket {} 2>&1",
         binary.to_str().unwrap(),
         config.to_str().unwrap(),
         socket.to_str().unwrap()
@@ -282,11 +284,10 @@ fn start_febgp_in_namespace(
         .args(["netns", "exec", &ns.name, "sh", "-c", &cmd])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null()) // stderr is redirected to stdout in the shell command
         .spawn()?;
 
-    // Read stdout in a separate thread and send events
-    // (tracing-subscriber writes to stdout by default)
+    // Read stdout (which now includes stderr) in a separate thread and send events
     let stdout = child.stdout.take().unwrap();
     let ns_name = ns.name.clone();
     let reader_thread = thread::spawn(move || {
