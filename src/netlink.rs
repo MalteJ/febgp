@@ -1,4 +1,21 @@
 //! Netlink interface for installing routes into the Linux routing table.
+//!
+//! # Implementation Notes
+//!
+//! Route **removal** uses native rtnetlink where possible:
+//! - IPv4 routes with IPv4 gateways: rtnetlink
+//! - IPv6 routes with IPv6 gateways: rtnetlink
+//! - IPv4 routes with IPv6 gateways (RFC 5549): shell (`ip route del`)
+//!   - rtnetlink doesn't reliably expose RTA_VIA attributes when enumerating routes
+//!
+//! Route **installation** uses the `ip` command for ECMP support:
+//! - rtnetlink's `RouteAddRequest` doesn't expose `NLM_F_APPEND` flag
+//! - Without append semantics, adding a second route to the same prefix fails
+//! - The `ip route append` command handles ECMP correctly
+//!
+//! For IPv4-via-IPv6 routes (RFC 5549), both install and remove use `ip` command:
+//! - Requires `via inet6` syntax which maps to the RTA_VIA netlink attribute
+//! - rtnetlink's high-level API doesn't provide reliable RTA_VIA support
 
 use std::net::IpAddr;
 
@@ -277,6 +294,9 @@ async fn install_route_v4_via_v6(
 }
 
 /// Remove IPv4 route with IPv6 gateway (specific next-hop for ECMP).
+///
+/// Uses shell command because rtnetlink's route enumeration doesn't reliably
+/// expose the RTA_VIA attribute for IPv4-via-IPv6 routes in a way we can match.
 async fn remove_route_v4_via_v6(
     _handle: &Handle,
     dest: std::net::Ipv4Addr,
@@ -312,25 +332,24 @@ async fn remove_route_v4_via_v6(
 }
 
 /// Remove IPv4 route by prefix only (fallback when next-hop is unknown).
+/// Removes all BGP routes matching the destination prefix.
 async fn remove_route_v4_any(
-    _handle: &Handle,
+    handle: &Handle,
     dest: std::net::Ipv4Addr,
     prefix_len: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
+    // Find and delete all matching BGP routes
+    let mut routes = handle.route().get(rtnetlink::IpVersion::V4).execute();
 
-    let prefix = format!("{}/{}", dest, prefix_len);
-
-    // Delete all BGP routes for this prefix
-    let output = Command::new("ip")
-        .args(["route", "del", &prefix, "proto", "bgp"])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "No such process" error (route doesn't exist)
-        if !stderr.contains("No such process") && !stderr.contains("RTNETLINK answers: No such process") {
-            return Err(format!("ip route del failed: {}", stderr).into());
+    while let Some(route) = routes.try_next().await? {
+        // Check if this route matches our prefix
+        if let Some((route_dest, route_prefix_len)) = get_route_v4_dest(&route) {
+            if route_dest == dest && route_prefix_len == prefix_len {
+                // Check if it's a BGP route (protocol 186)
+                if route.header.protocol == RTPROT_BGP {
+                    handle.route().del(route).execute().await?;
+                }
+            }
         }
     }
 

@@ -123,7 +123,7 @@ pub fn parse_update(data: &[u8]) -> Vec<ParsedRoute> {
                     let safi = attr_data[2];
                     let nh_len = attr_data[3] as usize;
 
-                    if 4 + nh_len + 1 <= attr_len && safi == 1 {
+                    if 4 + nh_len < attr_len && safi == 1 {
                         let nh_data = &attr_data[4..4 + nh_len];
                         let nlri_start = 4 + nh_len + 1; // +1 for reserved byte
                         let nlri_data = &attr_data[nlri_start..];
@@ -263,7 +263,7 @@ fn parse_ipv4_nlri(data: &[u8]) -> Vec<String> {
         let prefix_len = data[pos] as usize;
         pos += 1;
 
-        let bytes_needed = (prefix_len + 7) / 8;
+        let bytes_needed = prefix_len.div_ceil(8);
         if pos + bytes_needed > data.len() {
             break;
         }
@@ -290,7 +290,7 @@ fn parse_ipv6_nlri(data: &[u8]) -> Vec<String> {
         let prefix_len = data[pos] as usize;
         pos += 1;
 
-        let bytes_needed = (prefix_len + 7) / 8;
+        let bytes_needed = prefix_len.div_ceil(8);
         if pos + bytes_needed > data.len() {
             break;
         }

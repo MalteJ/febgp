@@ -5,13 +5,14 @@ use tonic::{Request, Response, Status};
 use super::proto::{Empty, Neighbor, Route, RoutesResponse, StatusResponse};
 use super::FebgpService;
 use crate::bgp::SessionState;
+use crate::rib::Rib;
 
 /// Shared daemon state accessible by gRPC handlers
 pub struct DaemonState {
     pub asn: u32,
     pub router_id: String,
     pub neighbors: Vec<NeighborState>,
-    pub routes: Vec<RouteEntry>,
+    pub rib: Rib,
 }
 
 pub struct NeighborState {
@@ -24,23 +25,13 @@ pub struct NeighborState {
     pub prefixes_received: u64,
 }
 
-pub struct RouteEntry {
-    pub prefix: String,
-    pub next_hop: String,
-    pub as_path: String,
-    pub as_path_len: usize, // For efficient comparison
-    pub origin: String,
-    pub peer_idx: usize, // Which peer this route came from
-    pub best: bool,
-}
-
 impl DaemonState {
     pub fn new(asn: u32, router_id: String) -> Self {
         Self {
             asn,
             router_id,
             neighbors: Vec::new(),
-            routes: Vec::new(),
+            rib: Rib::new(),
         }
     }
 }
@@ -91,7 +82,8 @@ impl FebgpService for FebgpServiceImpl {
         let state = self.state.read().await;
 
         let routes = state
-            .routes
+            .rib
+            .routes()
             .iter()
             .map(|r| Route {
                 prefix: r.prefix.clone(),
