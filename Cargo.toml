@@ -16,9 +16,9 @@ Supports BGP-4, 4-octet ASN, IPv6, and FIB installation via netlink."""
 section = "net"
 priority = "optional"
 assets = [
-    ["target/release/febgp", "usr/sbin/", "755"],
-    ["debian/config.toml", "etc/febgp/config.toml", "644"],
-    ["debian/febgp.service", "lib/systemd/system/febgp.service", "644"],
+    ["target/release/febgp", "/usr/sbin/", "755"],
+    ["debian/config.toml", "/etc/febgp/config.toml", "644"],
+    ["debian/febgp.service", "/lib/systemd/system/febgp.service", "644"],
 ]
 conf-files = ["/etc/febgp/config.toml"]
 maintainer-scripts = "debian/"
