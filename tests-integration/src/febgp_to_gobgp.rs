@@ -758,3 +758,194 @@ remote_asn = 65002
 
     println!("FeBGP daemon RIB test passed!");
 }
+
+/// Test that FeBGP daemon can establish sessions with two GoBGP peers simultaneously.
+///
+/// Topology:
+///          GoBGP1 (AS 65002, ns2)
+///         /  eth0 <-> eth0
+/// FeBGP (AS 65001, ns1)
+///         \  eth1 <-> eth0
+///          GoBGP2 (AS 65003, ns3)
+#[test]
+fn test_febgp_two_gobgp_peers() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create three network namespaces
+    let ns1 = NetNs::new("febgp_test_2p_r1").expect("Failed to create namespace r1");
+    let ns2 = NetNs::new("febgp_test_2p_r2").expect("Failed to create namespace r2");
+    let ns3 = NetNs::new("febgp_test_2p_r3").expect("Failed to create namespace r3");
+
+    // Create veth pairs: ns1:eth0 <-> ns2:eth0, ns1:eth1 <-> ns3:eth0
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair 1");
+    create_veth_pair(&ns1, "eth1", &ns3, "eth0").expect("Failed to create veth pair 2");
+
+    // Wait for DAD to complete
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1_eth0 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1 eth0");
+    let addr1_eth1 = wait_for_link_local(&ns1, "eth1").expect("Failed to get link-local for r1 eth1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+    let addr3 = wait_for_link_local(&ns3, "eth0").expect("Failed to get link-local for r3");
+
+    println!("FeBGP (ns1) eth0 link-local: {}", addr1_eth0);
+    println!("FeBGP (ns1) eth1 link-local: {}", addr1_eth1);
+    println!("GoBGP1 (ns2) link-local: {}", addr2);
+    println!("GoBGP2 (ns3) link-local: {}", addr3);
+
+    // Configure GoBGP1 (AS 65002)
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth0),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Configure GoBGP2 (AS 65003)
+    let config3 = GobgpConfig {
+        asn: 65003,
+        router_id: Ipv4Addr::new(3, 3, 3, 3),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth1),
+            local_address: format!("{}%eth0", addr3),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start both GoBGP instances
+    let gobgp1 = GobgpInstance::start(&ns2, &config2, 50061).expect("Failed to start GoBGP1");
+    let gobgp2 = GobgpInstance::start(&ns3, &config3, 50062).expect("Failed to start GoBGP2");
+
+    // Give GoBGP time to start
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Have each GoBGP announce a prefix
+    gobgp1.announce_prefix_v4("10.2.0.0/24").expect("Failed to announce prefix from GoBGP1");
+    gobgp2.announce_prefix_v4("10.3.0.0/24").expect("Failed to announce prefix from GoBGP2");
+
+    // Create FeBGP config with two peers
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_2peers_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_2peers_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+
+[[peer]]
+interface = "eth1"
+address = "{}%eth1"
+remote_asn = 65003
+"#,
+            addr2, addr3
+        ),
+    )
+    .expect("Failed to write config");
+
+    // Start FeBGP daemon
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon",
+            "-c",
+            &config_path,
+            "--socket",
+            &socket_path,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for sessions to establish and routes to be received
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Run febgp status command
+    let status_output = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "status",
+            "-s",
+            &socket_path,
+        ])
+        .output()
+        .expect("Failed to run febgp status");
+
+    let status_stdout = String::from_utf8_lossy(&status_output.stdout);
+    println!("FeBGP status output:\n{}", status_stdout);
+
+    // Run febgp routes command
+    let routes_output = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "routes",
+            "-s",
+            &socket_path,
+        ])
+        .output()
+        .expect("Failed to run febgp routes");
+
+    let routes_stdout = String::from_utf8_lossy(&routes_output.stdout);
+    println!("FeBGP routes output:\n{}", routes_stdout);
+
+    // Check GoBGP neighbor states
+    println!("=== GoBGP1 neighbor state ===");
+    println!("{}", gobgp1.get_neighbor_summary());
+    println!("=== GoBGP2 neighbor state ===");
+    println!("{}", gobgp2.get_neighbor_summary());
+
+    // Kill daemon
+    let _ = daemon.kill();
+
+    // Clean up config
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Verify both sessions are established
+    let established_count = status_stdout.matches("Established").count();
+    assert!(
+        established_count >= 2,
+        "Expected 2 Established sessions, found {}. Status:\n{}",
+        established_count,
+        status_stdout
+    );
+
+    // Verify routes from both peers are received
+    assert!(
+        routes_stdout.contains("10.2.0.0/24"),
+        "RIB should contain 10.2.0.0/24 from GoBGP1"
+    );
+    assert!(
+        routes_stdout.contains("10.3.0.0/24"),
+        "RIB should contain 10.3.0.0/24 from GoBGP2"
+    );
+
+    println!("Two GoBGP peers test passed!");
+}

@@ -27,14 +27,12 @@ $(TOOLS_DIR)/gobgpd:
 test: tools build
 	@sudo -E env "PATH=$$PATH" cargo test -p tests-integration -- --nocapture; \
 	status=$$?; \
-	sudo ip netns del febgp_test_r1 2>/dev/null || true; \
-	sudo ip netns del febgp_test_r2 2>/dev/null || true; \
+	sudo ip netns list 2>/dev/null | grep '^febgp_test' | awk '{print $$1}' | xargs -r -n1 sudo ip netns del 2>/dev/null || true; \
 	exit $$status
 
 # Clean up any leftover network namespaces from failed tests
 clean:
-	-sudo ip netns del febgp_test_r1 2>/dev/null
-	-sudo ip netns del febgp_test_r2 2>/dev/null
+	-sudo ip netns list 2>/dev/null | grep '^febgp_test' | awk '{print $$1}' | xargs -r -n1 sudo ip netns del 2>/dev/null
 	cargo clean
 
 clean-tools:
