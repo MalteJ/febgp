@@ -828,9 +828,13 @@ fn test_febgp_two_gobgp_peers() {
     // Give GoBGP time to start
     std::thread::sleep(std::time::Duration::from_secs(1));
 
-    // Have each GoBGP announce a prefix
+    // Have each GoBGP announce a unique prefix
     gobgp1.announce_prefix_v4("10.2.0.0/24").expect("Failed to announce prefix from GoBGP1");
     gobgp2.announce_prefix_v4("10.3.0.0/24").expect("Failed to announce prefix from GoBGP2");
+
+    // Have both announce the same prefix (basic multi-path test - just verifies receipt)
+    gobgp1.announce_prefix_v4("10.4.0.0/24").expect("Failed to announce shared prefix from GoBGP1");
+    gobgp2.announce_prefix_v4("10.4.0.0/24").expect("Failed to announce shared prefix from GoBGP2");
 
     // Create FeBGP config with two peers
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -946,6 +950,311 @@ remote_asn = 65003
         routes_stdout.contains("10.3.0.0/24"),
         "RIB should contain 10.3.0.0/24 from GoBGP2"
     );
+    assert!(
+        routes_stdout.contains("10.4.0.0/24"),
+        "RIB should contain 10.4.0.0/24 (announced by both peers)"
+    );
+
+    // Note: Best path selection and ECMP are tested separately in
+    // test_febgp_aspath_selection and test_febgp_ecmp
 
     println!("Two GoBGP peers test passed!");
+}
+
+/// Test AS path length selection: shorter AS path should be preferred.
+/// This test announces the SHORTER path FIRST, then the LONGER path.
+/// With proper best path selection, the shorter path should still be selected.
+/// With last-received-wins, this test will FAIL (longer path wins).
+///
+/// See docs/implementation-status.md for details.
+#[test]
+fn test_febgp_aspath_selection() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create three network namespaces
+    let ns1 = NetNs::new("febgp_test_asp1").expect("Failed to create namespace r1");
+    let ns2 = NetNs::new("febgp_test_asp2").expect("Failed to create namespace r2");
+    let ns3 = NetNs::new("febgp_test_asp3").expect("Failed to create namespace r3");
+
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair 1");
+    create_veth_pair(&ns1, "eth1", &ns3, "eth0").expect("Failed to create veth pair 2");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let addr1_eth0 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1 eth0");
+    let addr1_eth1 = wait_for_link_local(&ns1, "eth1").expect("Failed to get link-local for r1 eth1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+    let addr3 = wait_for_link_local(&ns3, "eth0").expect("Failed to get link-local for r3");
+
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth0),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    let config3 = GobgpConfig {
+        asn: 65003,
+        router_id: Ipv4Addr::new(3, 3, 3, 3),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth1),
+            local_address: format!("{}%eth0", addr3),
+            remote_asn: 65001,
+        }],
+    };
+
+    let gobgp1 = GobgpInstance::start(&ns2, &config2, 50081).expect("Failed to start GoBGP1");
+    let gobgp2 = GobgpInstance::start(&ns3, &config3, 50082).expect("Failed to start GoBGP2");
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Create FeBGP config
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_aspath_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_aspath_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+
+[[peer]]
+interface = "eth1"
+address = "{}%eth1"
+remote_asn = 65003
+"#,
+            addr2, addr3
+        ),
+    )
+    .expect("Failed to write config");
+
+    // Start FeBGP FIRST
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns", "exec", &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon", "-c", &config_path, "--socket", &socket_path,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for sessions to establish
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // NOW announce routes in a deterministic order:
+    // GoBGP1: AS_PATH [65002] (length 1) - announced FIRST
+    // GoBGP2: AS_PATH [65003, 65099, 65098] (length 3) - announced SECOND
+    // If best path selection works: shorter path (65002) wins
+    // If last-received wins: longer path (65003 65099 65098) wins - TEST FAILS
+    gobgp1.announce_prefix_v4("10.6.0.0/24").expect("Failed to announce from GoBGP1");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    gobgp2.announce_prefix_v4_with_aspath("10.6.0.0/24", "65099 65098").expect("Failed to announce from GoBGP2");
+
+    // Wait for routes to be received
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let routes_output = Command::new("ip")
+        .args([
+            "netns", "exec", &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "routes", "-s", &socket_path,
+        ])
+        .output()
+        .expect("Failed to run febgp routes");
+
+    let routes_stdout = String::from_utf8_lossy(&routes_output.stdout);
+    println!("FeBGP routes output:\n{}", routes_stdout);
+
+    let _ = daemon.kill();
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Find the route for 10.6.0.0/24
+    let route_line = routes_stdout
+        .lines()
+        .find(|l| l.contains("10.6.0.0/24"))
+        .expect("Should find 10.6.0.0/24 in routes");
+
+    println!("Route for 10.6.0.0/24: {}", route_line);
+
+    // The shorter AS path (via 65002) should be selected
+    assert!(
+        route_line.contains("65002") && !route_line.contains("65099"),
+        "AS path selection failed: 10.6.0.0/24 should be via AS 65002 (shorter path), got: {}",
+        route_line
+    );
+
+    println!("AS path selection test passed!");
+}
+
+/// Test ECMP: when two peers announce the same prefix with equal AS path length,
+/// both paths should be kept in the RIB.
+///
+/// See docs/implementation-status.md for details.
+#[test]
+fn test_febgp_ecmp() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create three network namespaces
+    let ns1 = NetNs::new("febgp_test_ecmp1").expect("Failed to create namespace r1");
+    let ns2 = NetNs::new("febgp_test_ecmp2").expect("Failed to create namespace r2");
+    let ns3 = NetNs::new("febgp_test_ecmp3").expect("Failed to create namespace r3");
+
+    // Create veth pairs
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair 1");
+    create_veth_pair(&ns1, "eth1", &ns3, "eth0").expect("Failed to create veth pair 2");
+
+    // Wait for DAD
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1_eth0 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1 eth0");
+    let addr1_eth1 = wait_for_link_local(&ns1, "eth1").expect("Failed to get link-local for r1 eth1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+    let addr3 = wait_for_link_local(&ns3, "eth0").expect("Failed to get link-local for r3");
+
+    // Configure GoBGP1 (AS 65002)
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth0),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Configure GoBGP2 (AS 65003)
+    let config3 = GobgpConfig {
+        asn: 65003,
+        router_id: Ipv4Addr::new(3, 3, 3, 3),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth1),
+            local_address: format!("{}%eth0", addr3),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start both GoBGP instances
+    let gobgp1 = GobgpInstance::start(&ns2, &config2, 50071).expect("Failed to start GoBGP1");
+    let gobgp2 = GobgpInstance::start(&ns3, &config3, 50072).expect("Failed to start GoBGP2");
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Both announce the same prefix with equal AS path length (1 hop each)
+    // GoBGP1: 10.5.0.0/24 with AS_PATH [65002]
+    // GoBGP2: 10.5.0.0/24 with AS_PATH [65003]
+    gobgp1.announce_prefix_v4("10.5.0.0/24").expect("Failed to announce from GoBGP1");
+    gobgp2.announce_prefix_v4("10.5.0.0/24").expect("Failed to announce from GoBGP2");
+
+    // Create FeBGP config
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_ecmp_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_ecmp_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+
+[[peer]]
+interface = "eth1"
+address = "{}%eth1"
+remote_asn = 65003
+"#,
+            addr2, addr3
+        ),
+    )
+    .expect("Failed to write config");
+
+    // Start FeBGP daemon
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns", "exec", &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon", "-c", &config_path, "--socket", &socket_path,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Get routes
+    let routes_output = Command::new("ip")
+        .args([
+            "netns", "exec", &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "routes", "-s", &socket_path,
+        ])
+        .output()
+        .expect("Failed to run febgp routes");
+
+    let routes_stdout = String::from_utf8_lossy(&routes_output.stdout);
+    println!("FeBGP routes output:\n{}", routes_stdout);
+
+    let _ = daemon.kill();
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+
+    // For ECMP, we expect BOTH paths to be in the RIB for 10.5.0.0/24
+    // The CLI groups routes by prefix, so we need to check for both AS paths
+    // being present in the output (the second ECMP path won't repeat the prefix)
+    let has_65002 = routes_stdout.contains("65002");
+    let has_65003 = routes_stdout.contains("65003");
+
+    // Count best path markers (*) to verify both paths are marked as best
+    let best_markers = routes_stdout.lines()
+        .filter(|l| l.starts_with("*"))
+        .count();
+
+    println!("Has path via 65002: {}, Has path via 65003: {}", has_65002, has_65003);
+    println!("Best path markers: {}", best_markers);
+
+    assert!(
+        has_65002 && has_65003,
+        "ECMP: Expected paths via both 65002 and 65003. Routes:\n{}",
+        routes_stdout
+    );
+
+    assert!(
+        best_markers >= 2,
+        "ECMP: Expected at least 2 best paths (*), found {}. Routes:\n{}",
+        best_markers,
+        routes_stdout
+    );
+
+    println!("ECMP test passed!");
 }

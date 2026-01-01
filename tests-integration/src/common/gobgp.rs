@@ -174,6 +174,14 @@ impl GobgpInstance {
         Ok(())
     }
 
+    /// Announce an IPv4 prefix with a custom AS path (for testing best path selection)
+    /// The as_path should be space-separated ASNs, e.g., "65001 65002"
+    #[allow(dead_code)]
+    pub fn announce_prefix_v4_with_aspath(&self, prefix: &str, as_path: &str) -> io::Result<()> {
+        self.gobgp(&["global", "rib", "add", prefix, "-a", "ipv4", "aspath", as_path])?;
+        Ok(())
+    }
+
     /// Check if an IPv4 prefix is received from BGP
     #[allow(dead_code)]
     pub fn has_prefix_v4(&self, prefix: &str) -> bool {

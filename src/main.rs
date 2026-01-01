@@ -203,11 +203,23 @@ async fn show_routes_async(socket_path: &str) -> Result<(), Box<dyn std::error::
         );
         println!("{}", "-".repeat(112));
 
-        for r in &routes.routes {
-            let best = if r.best { "*" } else { "" };
+        // Sort routes by prefix for cleaner display
+        let mut sorted_routes = routes.routes.clone();
+        sorted_routes.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+
+        let mut last_prefix = String::new();
+        for r in &sorted_routes {
+            let best = if r.best { "*" } else { " " };
+            // Show prefix only for first route, empty for ECMP paths
+            let display_prefix = if r.prefix != last_prefix {
+                last_prefix = r.prefix.clone();
+                r.prefix.as_str()
+            } else {
+                "" // ECMP path - don't repeat prefix
+            };
             println!(
                 "{:<3} {:<40} {:<40} {:<20} {:<6}",
-                best, r.prefix, r.next_hop, r.as_path, r.origin
+                best, display_prefix, r.next_hop, r.as_path, r.origin
             );
         }
     }
@@ -381,7 +393,11 @@ async fn update_uptime(state: &Arc<RwLock<DaemonState>>, peer_idx: usize, uptime
     }
 }
 
-/// Add a route to the RIB.
+/// Add a route to the RIB with best path selection.
+///
+/// Best path selection (simplified, eBGP only):
+/// 1. Shorter AS_PATH wins
+/// 2. Equal AS_PATH length = ECMP (both marked as best)
 async fn add_route(
     state: &Arc<RwLock<DaemonState>>,
     peer_idx: usize,
@@ -397,27 +413,58 @@ async fn add_route(
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Check if route already exists (update it) or add new
-    let existing = s.routes.iter_mut().find(|r| r.prefix == route.prefix);
+    let as_path_len = route.as_path.len();
+    let prefix = route.prefix.clone();
 
-    if let Some(existing_route) = existing {
-        // Update existing route
+    // Check if we already have a route from this peer for this prefix
+    let existing_from_peer = s.routes.iter_mut().find(|r| {
+        r.prefix == prefix && r.peer_idx == peer_idx
+    });
+
+    if let Some(existing_route) = existing_from_peer {
+        // Update existing route from same peer
         existing_route.next_hop = route.next_hop.to_string();
         existing_route.as_path = as_path_str;
+        existing_route.as_path_len = as_path_len;
         existing_route.origin = route.origin.to_string();
     } else {
         // Add new route
         s.routes.push(RouteEntry {
-            prefix: route.prefix,
+            prefix: prefix.clone(),
             next_hop: route.next_hop.to_string(),
             as_path: as_path_str,
+            as_path_len,
             origin: route.origin.to_string(),
-            best: true, // For now, mark all routes as best
+            peer_idx,
+            best: false, // Will be set by recalculate_best_paths
         });
 
         // Update prefixes received counter
         if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
             neighbor.prefixes_received += 1;
+        }
+    }
+
+    // Recalculate best paths for this prefix
+    recalculate_best_paths(&mut s.routes, &prefix);
+}
+
+/// Recalculate best paths for a given prefix.
+/// Shorter AS path wins. Equal AS path length = ECMP (all marked as best).
+fn recalculate_best_paths(routes: &mut [RouteEntry], prefix: &str) {
+    // Find the minimum AS path length for this prefix
+    let min_as_path_len = routes
+        .iter()
+        .filter(|r| r.prefix == prefix)
+        .map(|r| r.as_path_len)
+        .min();
+
+    if let Some(min_len) = min_as_path_len {
+        // Mark routes with minimum AS path length as best (ECMP)
+        for route in routes.iter_mut() {
+            if route.prefix == prefix {
+                route.best = route.as_path_len == min_len;
+            }
         }
     }
 }

@@ -28,7 +28,9 @@ pub struct RouteEntry {
     pub prefix: String,
     pub next_hop: String,
     pub as_path: String,
+    pub as_path_len: usize, // For efficient comparison
     pub origin: String,
+    pub peer_idx: usize, // Which peer this route came from
     pub best: bool,
 }
 

@@ -88,6 +88,53 @@ This document tracks the implementation status of the BGP Finite State Machine p
 | Route Refresh | Not implemented | RFC 2918 |
 | Graceful Restart | Not implemented | RFC 4724 |
 
+## RIB and Best Path Selection
+
+### Current Implementation
+
+The RIB supports multiple routes per prefix with AS path length based best path selection:
+- Routes are stored in a `Vec<RouteEntry>` with peer tracking
+- Multiple routes per prefix are kept (one per peer)
+- Best path selection based on AS path length (shorter wins)
+- ECMP: Equal AS path length routes are all marked as best
+
+### AS Path Length Selection
+
+Per RFC 4271 Section 9.1.2.2, shorter AS paths are preferred:
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| AS path length comparison | Implemented | Shorter path wins |
+| AS_SET counting | Not implemented | AS_SET counts as 1 |
+
+Integration test: `test_febgp_aspath_selection`
+
+### ECMP (Equal-Cost Multi-Path)
+
+When multiple paths have equal AS path length, all are kept and marked as best:
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Multiple paths per prefix | Implemented | One route per peer per prefix |
+| Best path marking | Implemented | All shortest paths marked as best |
+
+Integration test: `test_febgp_ecmp`
+
+### Out of Scope (for now)
+
+The following RFC 4271 Section 9.1.2 decision criteria are not planned for initial implementation:
+
+| Criterion | RFC Section | Notes |
+|-----------|-------------|-------|
+| LOCAL_PREF | 9.1.2 | eBGP only, no local preference |
+| ORIGIN type | 9.1.2.2.c | IGP < EGP < INCOMPLETE |
+| MED comparison | 9.1.2.2.d | Multi-exit discriminator |
+| eBGP vs iBGP | 9.1.2.2.e | eBGP only, not applicable |
+| IGP cost | 9.1.2.2.f | No IGP integration |
+| Route age | 9.1.2.2.g | Oldest route preferred |
+| Router ID | 9.1.2.2.h | Lowest router ID wins |
+| Peer IP | 9.1.2.2.i | Lowest peer IP wins |
+
 ## Not Implemented Features
 
 ### Passive Mode / Connection Collision
