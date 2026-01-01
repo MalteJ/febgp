@@ -38,6 +38,7 @@ struct PeerSessionContext {
 
 #[derive(Parser)]
 #[command(name = "febgp")]
+#[command(version)]
 #[command(about = "FeBGP - A BGP daemon in Rust")]
 struct Cli {
     #[command(subcommand)]
@@ -406,6 +407,9 @@ fn run_daemon(config_path: &str, socket_path: &str, install_routes: bool) -> Exi
             return ExitCode::FAILURE;
         }
     };
+
+    // CLI flag overrides config value (either one enables route installation)
+    let install_routes = install_routes || config.install_routes;
 
     if let Err(e) = run_daemon_async(config, socket_path, install_routes) {
         error!("Daemon error: {}", e);

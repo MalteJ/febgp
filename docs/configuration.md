@@ -13,6 +13,9 @@ prefixes = ["2001:db8::/32", "2001:db8:1::/48"]
 hold_time = 9              # hold time in seconds
 connect_retry_time = 30    # connect retry in seconds
 
+# Optional: install routes into Linux routing table
+install_routes = false
+
 [[peer]]
 interface = "eth0"
 
@@ -31,6 +34,7 @@ address = "fe80::1"
 | `prefixes` | array | no | `[]` | IPv6 prefixes to announce |
 | `hold_time` | integer | no | `9` | BGP hold time in seconds (keepalive = hold_time / 3) |
 | `connect_retry_time` | integer | no | `30` | Connect retry timer in seconds |
+| `install_routes` | boolean | no | `false` | Install received routes into Linux routing table via netlink |
 
 ## Peer Configuration
 
@@ -79,7 +83,7 @@ febgp daemon [--config <path>] [--socket <path>] [--install-routes]
 |--------|---------|-------------|
 | `--config`, `-c` | /etc/febgp/config.toml | Path to configuration file |
 | `--socket` | /var/lib/febgp/grpc.sock | Unix socket path for gRPC API |
-| `--install-routes` | disabled | Install received routes into Linux routing table via netlink |
+| `--install-routes` | disabled | Install received routes into Linux routing table via netlink (can also be set via `install_routes` in config) |
 
 ### Status
 

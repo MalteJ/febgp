@@ -14,6 +14,9 @@ prefixes = []
 # hold_time = 9              # hold time in seconds (default: 9)
 # connect_retry_time = 30    # connect retry in seconds (default: 30)
 
+# Install routes into Linux routing table via netlink (optional)
+# install_routes = false
+
 # Peer configuration
 # Uncomment and configure for each BGP neighbor
 

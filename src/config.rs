@@ -28,6 +28,10 @@ pub struct Config {
     /// Default: true.
     #[serde(default = "default_true")]
     pub ipv6_unicast: bool,
+    /// Install routes into Linux routing table via netlink.
+    /// Default: false.
+    #[serde(default)]
+    pub install_routes: bool,
 }
 
 fn default_true() -> bool {
