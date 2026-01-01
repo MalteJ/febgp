@@ -5,10 +5,46 @@
 //! - Best path selection (shortest AS path, ECMP for equal paths)
 //! - Kernel route installation via netlink
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::bgp::ParsedRoute;
 use crate::netlink::NetlinkHandle;
+
+/// Special peer index for locally originated routes (via API).
+pub const LOCAL_PEER_IDX: usize = usize::MAX;
+
+/// Events emitted when routes change in the RIB.
+/// Subscribers receive these via the broadcast channel.
+#[derive(Debug, Clone)]
+pub enum RouteEvent {
+    /// A new route was added to the RIB.
+    Added(RouteEntry),
+    /// A route was withdrawn from the RIB.
+    Withdrawn {
+        prefix: String,
+        next_hop: String,
+        peer_idx: usize,
+    },
+    /// Best path changed for a prefix (includes the new best route).
+    BestChanged(RouteEntry),
+}
+
+/// A locally originated route added via API.
+#[derive(Debug, Clone)]
+pub struct ApiRoute {
+    pub prefix: String,
+    pub next_hop: Option<String>,
+    pub as_path: Vec<u32>,
+}
+
+/// Events for API route changes that need to be advertised to peers.
+#[derive(Debug, Clone)]
+pub enum ApiRouteAdvertisement {
+    /// Announce a new route to all peers.
+    Announce(ApiRoute),
+    /// Withdraw a route from all peers.
+    Withdraw { prefix: String },
+}
 
 /// A route entry in the RIB.
 #[derive(Debug, Clone)]
@@ -54,11 +90,27 @@ pub enum RibCommand {
     RemoveAllRoutes {
         response: oneshot::Sender<usize>,
     },
+    /// Add a locally originated route (via API).
+    AddApiRoute {
+        route: ApiRoute,
+        response: oneshot::Sender<Result<(), String>>,
+    },
+    /// Withdraw a locally originated route (via API).
+    WithdrawApiRoute {
+        prefix: String,
+        response: oneshot::Sender<Result<(), String>>,
+    },
+    /// Get all locally originated routes (for advertising to new peers).
+    GetApiRoutes {
+        response: oneshot::Sender<Vec<ApiRoute>>,
+    },
 }
 
 /// The Routing Information Base.
 pub struct Rib {
     routes: Vec<RouteEntry>,
+    /// Locally originated routes (added via API).
+    api_routes: Vec<ApiRoute>,
     /// Reusable netlink handle for route installation (None if route installation disabled)
     netlink: Option<NetlinkHandle>,
 }
@@ -82,6 +134,7 @@ impl Rib {
     pub fn new() -> Self {
         Self {
             routes: Vec::new(),
+            api_routes: Vec::new(),
             netlink: None,
         }
     }
@@ -93,8 +146,39 @@ impl Rib {
     pub fn with_netlink() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
             routes: Vec::new(),
+            api_routes: Vec::new(),
             netlink: Some(NetlinkHandle::new()?),
         })
+    }
+
+    /// Get all API routes.
+    pub fn api_routes(&self) -> &[ApiRoute] {
+        &self.api_routes
+    }
+
+    /// Add a locally originated route.
+    pub fn add_api_route(&mut self, route: ApiRoute) -> Result<(), String> {
+        // Check if route already exists
+        if self.api_routes.iter().any(|r| r.prefix == route.prefix) {
+            return Err(format!("Route for prefix {} already exists", route.prefix));
+        }
+
+        // Validate prefix format
+        if !is_valid_prefix(&route.prefix) {
+            return Err(format!("Invalid prefix format: {}", route.prefix));
+        }
+
+        self.api_routes.push(route);
+        Ok(())
+    }
+
+    /// Withdraw a locally originated route.
+    pub fn withdraw_api_route(&mut self, prefix: &str) -> Result<ApiRoute, String> {
+        let idx = self.api_routes.iter().position(|r| r.prefix == prefix);
+        match idx {
+            Some(i) => Ok(self.api_routes.remove(i)),
+            None => Err(format!("No API route for prefix {}", prefix)),
+        }
     }
 
     /// Get all routes.
@@ -313,6 +397,22 @@ fn format_next_hop(next_hop: &str, interface: &str) -> String {
     }
 }
 
+/// Validate prefix format (basic CIDR validation).
+fn is_valid_prefix(prefix: &str) -> bool {
+    let parts: Vec<&str> = prefix.split('/').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+
+    // Check if it's a valid IP address
+    let ip_valid = parts[0].parse::<std::net::IpAddr>().is_ok();
+
+    // Check if prefix length is valid
+    let prefix_len_valid = parts[1].parse::<u8>().is_ok();
+
+    ip_valid && prefix_len_valid
+}
+
 /// Recalculate best paths for a given prefix.
 /// Shorter AS path wins. Equal AS path length = ECMP (all marked as best).
 fn recalculate_best_paths(routes: &mut [RouteEntry], prefix: &str) {
@@ -339,6 +439,8 @@ fn recalculate_best_paths(routes: &mut [RouteEntry], prefix: &str) {
 pub struct RibActor {
     rib: Rib,
     command_rx: mpsc::Receiver<RibCommand>,
+    /// Broadcast sender for route change events.
+    event_tx: broadcast::Sender<RouteEvent>,
 }
 
 impl RibActor {
@@ -346,17 +448,24 @@ impl RibActor {
     ///
     /// If `install_routes` is true, routes will be installed into the
     /// Linux kernel via netlink.
+    ///
+    /// Returns the actor and a broadcast sender that can be cloned for subscribers.
     pub fn new(
         command_rx: mpsc::Receiver<RibCommand>,
         install_routes: bool,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Self, broadcast::Sender<RouteEvent>), Box<dyn std::error::Error + Send + Sync>> {
         let rib = if install_routes {
             Rib::with_netlink()?
         } else {
             Rib::new()
         };
 
-        Ok(Self { rib, command_rx })
+        // Create broadcast channel with reasonable capacity for route events.
+        // Subscribers that fall behind will miss events (lagged).
+        let (event_tx, _) = broadcast::channel(1024);
+        let event_tx_clone = event_tx.clone();
+
+        Ok((Self { rib, command_rx, event_tx }, event_tx_clone))
     }
 
     /// Run the actor event loop.
@@ -371,7 +480,12 @@ impl RibActor {
                     route,
                     interface,
                 } => {
+                    let prefix = route.prefix.clone();
                     self.rib.add_route(peer_idx, route, &interface).await;
+                    // Emit event for the added/updated route
+                    if let Some(entry) = self.rib.routes().iter().find(|r| r.prefix == prefix && r.peer_idx == peer_idx) {
+                        let _ = self.event_tx.send(RouteEvent::Added(entry.clone()));
+                    }
                 }
                 RibCommand::AddRoutes {
                     peer_idx,
@@ -379,11 +493,33 @@ impl RibActor {
                     interface,
                 } => {
                     for route in routes {
+                        let prefix = route.prefix.clone();
                         self.rib.add_route(peer_idx, route, &interface).await;
+                        // Emit event for each added/updated route
+                        if let Some(entry) = self.rib.routes().iter().find(|r| r.prefix == prefix && r.peer_idx == peer_idx) {
+                            let _ = self.event_tx.send(RouteEvent::Added(entry.clone()));
+                        }
                     }
                 }
                 RibCommand::RemovePeerRoutes { peer_idx, response } => {
+                    // Collect routes to be removed before removal
+                    let withdrawn: Vec<_> = self.rib.routes()
+                        .iter()
+                        .filter(|r| r.peer_idx == peer_idx)
+                        .map(|r| (r.prefix.clone(), r.next_hop.clone()))
+                        .collect();
+
                     let count = self.rib.remove_peer_routes(peer_idx).await;
+
+                    // Emit withdrawn events
+                    for (prefix, next_hop) in withdrawn {
+                        let _ = self.event_tx.send(RouteEvent::Withdrawn {
+                            prefix,
+                            next_hop,
+                            peer_idx,
+                        });
+                    }
+
                     let _ = response.send(count);
                 }
                 RibCommand::GetRoutes { response } => {
@@ -395,8 +531,59 @@ impl RibActor {
                     let _ = response.send(count);
                 }
                 RibCommand::RemoveAllRoutes { response } => {
+                    // Collect all routes before removal for withdrawal events
+                    let withdrawn: Vec<_> = self.rib.routes()
+                        .iter()
+                        .map(|r| (r.prefix.clone(), r.next_hop.clone(), r.peer_idx))
+                        .collect();
+
                     let count = self.rib.remove_all_routes().await;
+
+                    // Emit withdrawn events for all routes
+                    for (prefix, next_hop, peer_idx) in withdrawn {
+                        let _ = self.event_tx.send(RouteEvent::Withdrawn {
+                            prefix,
+                            next_hop,
+                            peer_idx,
+                        });
+                    }
+
                     let _ = response.send(count);
+                }
+                RibCommand::AddApiRoute { route, response } => {
+                    let prefix = route.prefix.clone();
+                    let result = self.rib.add_api_route(route.clone());
+                    if result.is_ok() {
+                        // Create a RouteEntry for the API route (for event emission)
+                        let entry = RouteEntry {
+                            prefix: prefix.clone(),
+                            next_hop: route.next_hop.clone().unwrap_or_default(),
+                            as_path: route.as_path.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(" "),
+                            as_path_len: route.as_path.len(),
+                            origin: "IGP".to_string(),
+                            peer_idx: LOCAL_PEER_IDX,
+                            best: true,
+                        };
+                        let _ = self.event_tx.send(RouteEvent::Added(entry));
+                        tracing::info!(prefix = %prefix, "Added API route");
+                    }
+                    let _ = response.send(result);
+                }
+                RibCommand::WithdrawApiRoute { prefix, response } => {
+                    let result = self.rib.withdraw_api_route(&prefix);
+                    if let Ok(route) = &result {
+                        let _ = self.event_tx.send(RouteEvent::Withdrawn {
+                            prefix: route.prefix.clone(),
+                            next_hop: route.next_hop.clone().unwrap_or_default(),
+                            peer_idx: LOCAL_PEER_IDX,
+                        });
+                        tracing::info!(prefix = %route.prefix, "Withdrawn API route");
+                    }
+                    let _ = response.send(result.map(|_| ()));
+                }
+                RibCommand::GetApiRoutes { response } => {
+                    let routes = self.rib.api_routes().to_vec();
+                    let _ = response.send(routes);
                 }
             }
         }
@@ -410,12 +597,22 @@ impl RibActor {
 #[derive(Clone)]
 pub struct RibHandle {
     sender: mpsc::Sender<RibCommand>,
+    /// Broadcast sender for subscribing to route events.
+    event_tx: broadcast::Sender<RouteEvent>,
 }
 
 impl RibHandle {
-    /// Create a new RibHandle from an mpsc sender.
-    pub fn new(sender: mpsc::Sender<RibCommand>) -> Self {
-        Self { sender }
+    /// Create a new RibHandle from an mpsc sender and broadcast sender.
+    pub fn new(sender: mpsc::Sender<RibCommand>, event_tx: broadcast::Sender<RouteEvent>) -> Self {
+        Self { sender, event_tx }
+    }
+
+    /// Subscribe to route update events.
+    ///
+    /// Returns a receiver that will receive RouteEvent notifications
+    /// whenever routes are added, withdrawn, or best path changes.
+    pub fn subscribe_updates(&self) -> broadcast::Receiver<RouteEvent> {
+        self.event_tx.subscribe()
     }
 
     /// Add a single route (fire-and-forget).
@@ -505,6 +702,51 @@ impl RibHandle {
             rx.await.unwrap_or(0)
         } else {
             0
+        }
+    }
+
+    /// Add a locally originated route (via API).
+    pub async fn add_api_route(&self, route: ApiRoute) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RibCommand::AddApiRoute { route, response: tx })
+            .await
+            .is_ok()
+        {
+            rx.await.unwrap_or_else(|_| Err("Channel closed".to_string()))
+        } else {
+            Err("Failed to send command".to_string())
+        }
+    }
+
+    /// Withdraw a locally originated route (via API).
+    pub async fn withdraw_api_route(&self, prefix: String) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RibCommand::WithdrawApiRoute { prefix, response: tx })
+            .await
+            .is_ok()
+        {
+            rx.await.unwrap_or_else(|_| Err("Channel closed".to_string()))
+        } else {
+            Err("Failed to send command".to_string())
+        }
+    }
+
+    /// Get all locally originated routes.
+    pub async fn get_api_routes(&self) -> Vec<ApiRoute> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RibCommand::GetApiRoutes { response: tx })
+            .await
+            .is_ok()
+        {
+            rx.await.unwrap_or_default()
+        } else {
+            Vec::new()
         }
     }
 }
@@ -742,5 +984,301 @@ mod tests {
         assert_eq!(rib.routes().len(), 1);
         assert!(rib.routes()[0].best);
         assert_eq!(rib.routes()[0].peer_idx, 1);
+    }
+
+    // Tests for new API route functionality
+
+    #[test]
+    fn test_is_valid_prefix_ipv4() {
+        assert!(is_valid_prefix("10.0.0.0/24"));
+        assert!(is_valid_prefix("192.168.1.0/32"));
+        assert!(is_valid_prefix("0.0.0.0/0"));
+    }
+
+    #[test]
+    fn test_is_valid_prefix_ipv6() {
+        assert!(is_valid_prefix("2001:db8::/32"));
+        assert!(is_valid_prefix("fe80::1/128"));
+        assert!(is_valid_prefix("::/0"));
+    }
+
+    #[test]
+    fn test_is_valid_prefix_invalid() {
+        assert!(!is_valid_prefix("10.0.0.0")); // Missing prefix length
+        assert!(!is_valid_prefix("invalid/24")); // Invalid IP
+        assert!(!is_valid_prefix("10.0.0.0/abc")); // Invalid prefix length
+        assert!(!is_valid_prefix("")); // Empty string
+    }
+
+    #[test]
+    fn test_api_route_add() {
+        let mut rib = Rib::new();
+
+        let route = ApiRoute {
+            prefix: "10.0.0.0/24".to_string(),
+            next_hop: Some("192.168.1.1".to_string()),
+            as_path: vec![65001],
+        };
+
+        let result = rib.add_api_route(route);
+        assert!(result.is_ok());
+        assert_eq!(rib.api_routes().len(), 1);
+        assert_eq!(rib.api_routes()[0].prefix, "10.0.0.0/24");
+    }
+
+    #[test]
+    fn test_api_route_add_duplicate() {
+        let mut rib = Rib::new();
+
+        let route1 = ApiRoute {
+            prefix: "10.0.0.0/24".to_string(),
+            next_hop: None,
+            as_path: vec![],
+        };
+
+        let route2 = ApiRoute {
+            prefix: "10.0.0.0/24".to_string(),
+            next_hop: Some("192.168.1.1".to_string()),
+            as_path: vec![65001],
+        };
+
+        assert!(rib.add_api_route(route1).is_ok());
+        let result = rib.add_api_route(route2);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already exists"));
+    }
+
+    #[test]
+    fn test_api_route_add_invalid_prefix() {
+        let mut rib = Rib::new();
+
+        let route = ApiRoute {
+            prefix: "invalid".to_string(),
+            next_hop: None,
+            as_path: vec![],
+        };
+
+        let result = rib.add_api_route(route);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid prefix"));
+    }
+
+    #[test]
+    fn test_api_route_withdraw() {
+        let mut rib = Rib::new();
+
+        let route = ApiRoute {
+            prefix: "10.0.0.0/24".to_string(),
+            next_hop: None,
+            as_path: vec![],
+        };
+
+        rib.add_api_route(route).unwrap();
+        assert_eq!(rib.api_routes().len(), 1);
+
+        let result = rib.withdraw_api_route("10.0.0.0/24");
+        assert!(result.is_ok());
+        assert_eq!(rib.api_routes().len(), 0);
+    }
+
+    #[test]
+    fn test_api_route_withdraw_not_found() {
+        let mut rib = Rib::new();
+
+        let result = rib.withdraw_api_route("10.0.0.0/24");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No API route"));
+    }
+
+    #[tokio::test]
+    async fn test_rib_actor_route_events() {
+        use tokio::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel::<RibCommand>(32);
+        let (actor, event_tx) = RibActor::new(rx, false).unwrap();
+
+        // Subscribe to events before spawning actor
+        let mut event_rx = event_tx.subscribe();
+
+        // Spawn the actor
+        tokio::spawn(actor.run());
+
+        // Create handle
+        let handle = RibHandle::new(tx, event_tx);
+
+        // Add a route
+        let route = test_route("10.0.0.0/24", "192.168.1.1", vec![65001]);
+        handle.add_route(0, route, "eth0".to_string()).await;
+
+        // Wait for and verify the event
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            event_rx.recv()
+        ).await;
+
+        assert!(event.is_ok());
+        let event = event.unwrap().unwrap();
+        match event {
+            RouteEvent::Added(entry) => {
+                assert_eq!(entry.prefix, "10.0.0.0/24");
+                assert_eq!(entry.peer_idx, 0);
+            }
+            _ => panic!("Expected RouteEvent::Added"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rib_actor_api_route_add() {
+        use tokio::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel::<RibCommand>(32);
+        let (actor, event_tx) = RibActor::new(rx, false).unwrap();
+
+        // Subscribe to events
+        let mut event_rx = event_tx.subscribe();
+
+        // Spawn the actor
+        tokio::spawn(actor.run());
+
+        // Create handle
+        let handle = RibHandle::new(tx, event_tx);
+
+        // Add an API route
+        let route = ApiRoute {
+            prefix: "10.0.0.0/24".to_string(),
+            next_hop: Some("192.168.1.1".to_string()),
+            as_path: vec![65001],
+        };
+
+        let result = handle.add_api_route(route).await;
+        assert!(result.is_ok());
+
+        // Verify event was emitted
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            event_rx.recv()
+        ).await;
+
+        assert!(event.is_ok());
+        let event = event.unwrap().unwrap();
+        match event {
+            RouteEvent::Added(entry) => {
+                assert_eq!(entry.prefix, "10.0.0.0/24");
+                assert_eq!(entry.peer_idx, LOCAL_PEER_IDX);
+            }
+            _ => panic!("Expected RouteEvent::Added"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rib_actor_api_route_withdraw() {
+        use tokio::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel::<RibCommand>(32);
+        let (actor, event_tx) = RibActor::new(rx, false).unwrap();
+
+        // Subscribe to events
+        let mut event_rx = event_tx.subscribe();
+
+        // Spawn the actor
+        tokio::spawn(actor.run());
+
+        // Create handle
+        let handle = RibHandle::new(tx, event_tx);
+
+        // Add an API route first
+        let route = ApiRoute {
+            prefix: "10.0.0.0/24".to_string(),
+            next_hop: None,
+            as_path: vec![],
+        };
+        handle.add_api_route(route).await.unwrap();
+
+        // Consume the add event
+        let _ = event_rx.recv().await;
+
+        // Withdraw the route
+        let result = handle.withdraw_api_route("10.0.0.0/24".to_string()).await;
+        assert!(result.is_ok());
+
+        // Verify withdrawal event
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            event_rx.recv()
+        ).await;
+
+        assert!(event.is_ok());
+        let event = event.unwrap().unwrap();
+        match event {
+            RouteEvent::Withdrawn { prefix, peer_idx, .. } => {
+                assert_eq!(prefix, "10.0.0.0/24");
+                assert_eq!(peer_idx, LOCAL_PEER_IDX);
+            }
+            _ => panic!("Expected RouteEvent::Withdrawn"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rib_handle_get_api_routes() {
+        use tokio::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel::<RibCommand>(32);
+        let (actor, event_tx) = RibActor::new(rx, false).unwrap();
+
+        tokio::spawn(actor.run());
+        let handle = RibHandle::new(tx, event_tx);
+
+        // Add some API routes
+        handle.add_api_route(ApiRoute {
+            prefix: "10.0.0.0/24".to_string(),
+            next_hop: None,
+            as_path: vec![],
+        }).await.unwrap();
+
+        handle.add_api_route(ApiRoute {
+            prefix: "192.168.0.0/16".to_string(),
+            next_hop: Some("10.0.0.1".to_string()),
+            as_path: vec![65001, 65002],
+        }).await.unwrap();
+
+        // Get API routes
+        let routes = handle.get_api_routes().await;
+        assert_eq!(routes.len(), 2);
+
+        let prefixes: Vec<_> = routes.iter().map(|r| r.prefix.as_str()).collect();
+        assert!(prefixes.contains(&"10.0.0.0/24"));
+        assert!(prefixes.contains(&"192.168.0.0/16"));
+    }
+
+    #[tokio::test]
+    async fn test_rib_handle_subscribe_updates() {
+        use tokio::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel::<RibCommand>(32);
+        let (actor, event_tx) = RibActor::new(rx, false).unwrap();
+
+        tokio::spawn(actor.run());
+        let handle = RibHandle::new(tx, event_tx);
+
+        // Subscribe to updates
+        let mut rx1 = handle.subscribe_updates();
+        let mut rx2 = handle.subscribe_updates();
+
+        // Add a route
+        let route = test_route("10.0.0.0/24", "192.168.1.1", vec![65001]);
+        handle.add_route(0, route, "eth0".to_string()).await;
+
+        // Both subscribers should receive the event
+        let event1 = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            rx1.recv()
+        ).await;
+        let event2 = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            rx2.recv()
+        ).await;
+
+        assert!(event1.is_ok());
+        assert!(event2.is_ok());
     }
 }

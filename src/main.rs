@@ -18,7 +18,8 @@ use febgp::{FebgpServiceServer, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH};
 use febgp::bgp::{self, build_ipv4_update, build_ipv6_update, parse_update, FsmConfig, FsmState, SessionActor, SessionCommand, SessionEvent, TcpTransport};
 use febgp::config::{parse_peer_address, Config, PeerConfig};
 use febgp::neighbor_discovery::{get_interface_link_local, NeighborDiscovery, NeighborEvent};
-use febgp::rib::{RibActor, RibCommand, RibHandle};
+use febgp::peer_manager::{PeerManager, PeerManagerConfig, PeerManagerHandle, PeerManagerCommand};
+use febgp::rib::{RibActor, RibCommand, RibHandle, RouteEvent, LOCAL_PEER_IDX};
 
 /// Context for running a peer session.
 struct PeerSessionContext {
@@ -111,10 +112,11 @@ async fn run_daemon_async(
 
     // Create RibActor with command channel
     let (rib_tx, rib_rx) = mpsc::channel::<RibCommand>(256);
-    let rib_handle = RibHandle::new(rib_tx);
 
-    let rib_actor = RibActor::new(rib_rx, install_routes)
+    let (rib_actor, route_event_tx) = RibActor::new(rib_rx, install_routes)
         .map_err(|e| format!("Failed to create RibActor: {}", e))?;
+
+    let rib_handle = RibHandle::new(rib_tx, route_event_tx);
 
     tokio::spawn(async move {
         rib_actor.run().await;
@@ -155,6 +157,37 @@ async fn run_daemon_async(
     // Shutdown signal - broadcast to all peer sessions
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // Create PeerManager for dynamic peer management
+    let (pm_tx, pm_rx) = mpsc::channel::<PeerManagerCommand>(32);
+    let peer_manager_handle = PeerManagerHandle::new(pm_tx);
+    let peer_manager = PeerManager::new(
+        pm_rx,
+        PeerManagerConfig {
+            state: Arc::clone(&state),
+            rib_handle: rib_handle.clone(),
+            shutdown_rx: shutdown_rx.clone(),
+            local_asn: config.asn,
+            router_id: config.router_id,
+            prefixes: config.prefixes.clone(),
+            hold_time: config.hold_time,
+            connect_retry_time: config.connect_retry_time,
+            ipv4_unicast: config.ipv4_unicast,
+            ipv6_unicast: config.ipv6_unicast,
+            initial_peer_count: config.peers.len(),
+        },
+    );
+
+    // Set PeerManager handle on DaemonState
+    {
+        let mut s = state.write().await;
+        s.set_peer_manager(peer_manager_handle.clone());
+    }
+
+    // Spawn PeerManager task
+    tokio::spawn(async move {
+        peer_manager.run().await;
+    });
+
     // Store peer configs for interfaces awaiting neighbor discovery
     // Maps interface name to (peer_idx, peer_config)
     let mut discovery_peers: HashMap<String, (usize, PeerConfig)> = HashMap::new();
@@ -187,6 +220,9 @@ async fn run_daemon_async(
                 // Register this peer's address for incoming connection routing
                 let addr_key = extract_ip_addr(&peer_addr);
                 peer_addr_to_sender.write().await.insert(addr_key, cmd_tx.clone());
+
+                // Register with PeerManager
+                peer_manager_handle.register_startup_peer(peer_idx, peer.clone(), cmd_tx.clone()).await;
 
                 tokio::spawn(async move {
                     run_peer_session(ctx, cmd_tx, cmd_rx, Some(peer_addr)).await;
@@ -236,6 +272,7 @@ async fn run_daemon_async(
     let neighbor_rib_handle = rib_handle.clone();
     let neighbor_session_senders = Arc::clone(&session_senders);
     let neighbor_peer_addr_to_sender = Arc::clone(&peer_addr_to_sender);
+    let neighbor_peer_manager_handle = peer_manager_handle.clone();
     let neighbor_config_asn = config.asn;
     let neighbor_config_router_id = config.router_id;
     let neighbor_config_prefixes = config.prefixes.clone();
@@ -262,6 +299,7 @@ async fn run_daemon_async(
                     if let Some((peer_idx, peer)) = discovery_peers.get(&interface) {
                         let peer_idx = *peer_idx;
                         let peer = peer.clone();
+                        let peer_for_pm = peer.clone();
 
                         // Create peer address with scope ID
                         let peer_addr = SocketAddr::V6(std::net::SocketAddrV6::new(
@@ -301,6 +339,9 @@ async fn run_daemon_async(
                         // Register for incoming connection routing
                         let addr_key = extract_ip_addr(&peer_addr);
                         neighbor_peer_addr_to_sender.write().await.insert(addr_key, cmd_tx.clone());
+
+                        // Register with PeerManager
+                        neighbor_peer_manager_handle.register_startup_peer(peer_idx, peer_for_pm, cmd_tx.clone()).await;
 
                         // Spawn the BGP session
                         tokio::spawn(async move {
@@ -604,148 +645,217 @@ async fn run_peer_session(
     }
 
     let mut established_at: Option<Instant> = None;
+    let mut is_established = false;
 
-    // Process events from the session actor
-    while let Some(event) = event_rx.recv().await {
-        match event {
-            SessionEvent::StateChange { to, .. } => {
-                update_peer_state(&state, peer_idx, to.into()).await;
+    // Subscribe to route events for API route advertisements
+    let mut route_events_rx = rib_handle.subscribe_updates();
 
-                if to == FsmState::Established {
-                    established_at = Some(Instant::now());
-                    info!(peer = %peer_addr, "Session established with {}", peer_addr);
-                } else if to == FsmState::Idle {
-                    established_at = None;
-                }
-            }
-            SessionEvent::Established { peer_asn, peer_router_id, .. } => {
-                // Update with learned ASN
-                update_peer_asn(&state, peer_idx, peer_asn).await;
-                info!(
-                    peer = %peer_addr,
-                    asn = peer_asn,
-                    router_id = %peer_router_id,
-                    "Peer {} (AS{}) router-id: {}",
-                    peer_addr, peer_asn, peer_router_id
-                );
-
-                // Get our link-local address for the interface to use as next-hop
-                let local_link_local = match get_interface_link_local(&peer.interface) {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        error!(
-                            interface = peer.interface,
-                            error = %e,
-                            "Failed to get link-local address for {}: {}",
-                            peer.interface, e
-                        );
-                        continue;
-                    }
-                };
-
-                // Announce configured prefixes
-                for prefix in &prefixes {
-                    let update_body = if prefix.contains(':') {
-                        // IPv6 prefix
-                        build_ipv6_update(prefix, local_asn, local_link_local)
-                    } else {
-                        // IPv4 prefix (RFC 5549: IPv4 NLRI with IPv6 next-hop)
-                        build_ipv4_update(prefix, local_asn, local_link_local)
-                    };
-
-                    if let Some(body) = update_body {
-                        if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
-                            error!(prefix = prefix, peer = %peer_addr, error = %e, "Failed to send UPDATE for {}: {}", prefix, e);
-                        } else {
-                            debug!(prefix = prefix, peer = %peer_addr, "Announced prefix {} to {}", prefix, peer_addr);
-                        }
-                    } else {
-                        error!(prefix = prefix, "Failed to build UPDATE for prefix: {}", prefix);
-                    }
-                }
-            }
-            SessionEvent::SessionDown { reason } => {
-                warn!(peer = %peer_addr, reason = reason, "Session to {} went down: {}", peer_addr, reason);
-                update_peer_state(&state, peer_idx, bgp::SessionState::Idle).await;
-
-                // Remove all routes from this peer via RibActor (no write lock needed for RIB)
-                let removed = rib_handle.remove_peer_routes(peer_idx).await;
-
-                // Update neighbor state
-                {
-                    let mut s = state.write().await;
-                    if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
-                        neighbor.prefixes_received = 0;
-                    }
-                }
-
-                if removed > 0 {
-                    info!(peer_idx = peer_idx, routes_removed = removed, "Removed {} route(s) from peer {}", removed, peer_idx);
-                }
-                established_at = None;
-
-                // Automatic reconnection after a short delay (unless shutting down)
-                let cmd_tx_clone = cmd_tx.clone();
-                let shutdown_rx_clone = shutdown_rx.clone();
-                tokio::spawn(async move {
-                    // Wait before attempting reconnection (avoids tight reconnect loop)
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                    // Skip reconnection if shutdown is in progress
-                    if *shutdown_rx_clone.borrow() {
-                        debug!(peer = %peer_addr, "Skipping reconnect due to shutdown");
-                        return;
-                    }
-
-                    debug!(peer = %peer_addr, "Attempting to reconnect to peer...");
-                    match cmd_tx_clone.send(SessionCommand::Start).await {
-                        Ok(()) => debug!(peer = %peer_addr, "Reconnect command sent to {}", peer_addr),
-                        Err(e) => error!(peer = %peer_addr, error = %e, "Failed to send reconnect command: {}", e),
-                    }
-                });
-            }
-            SessionEvent::UpdateReceived(data) => {
-                // Parse UPDATE and add routes to RIB
-                let routes = parse_update(&data);
-
-                // Log received routes
-                for route in &routes {
-                    debug!(
-                        peer_idx = peer_idx,
-                        prefix = %route.prefix,
-                        next_hop = %route.next_hop,
-                        as_path = ?route.as_path,
-                        "Route received: {} via {} AS_PATH {:?}",
-                        route.prefix, route.next_hop, route.as_path
-                    );
-                }
-
-                // Get the interface for this peer
-                let interface = {
-                    let s = state.read().await;
-                    s.neighbors
-                        .get(peer_idx)
-                        .map(|n| n.interface.clone())
-                        .unwrap_or_default()
-                };
-
-                // Send routes to RibActor (no write lock needed)
-                rib_handle.add_routes(peer_idx, routes, interface).await;
-
-                // Update prefix count from RibActor
-                let count = rib_handle.get_peer_stats(peer_idx).await;
-                {
-                    let mut s = state.write().await;
-                    if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
-                        neighbor.prefixes_received = count as u64;
-                    }
-                }
-            }
+    // Helper to announce a prefix to this peer
+    let announce_prefix = |prefix: &str, local_asn: u32, local_link_local: std::net::Ipv6Addr| -> Option<Vec<u8>> {
+        if prefix.contains(':') {
+            build_ipv6_update(prefix, local_asn, local_link_local)
+        } else {
+            build_ipv4_update(prefix, local_asn, local_link_local)
         }
+    };
 
-        // Update uptime
-        if let Some(started) = established_at {
-            update_uptime(&state, peer_idx, started.elapsed().as_secs()).await;
+    // Process events from the session actor and route events
+    loop {
+        tokio::select! {
+            // Handle session events
+            event = event_rx.recv() => {
+                let Some(event) = event else { break };
+
+                match event {
+                    SessionEvent::StateChange { to, .. } => {
+                        update_peer_state(&state, peer_idx, to.into()).await;
+
+                        if to == FsmState::Established {
+                            established_at = Some(Instant::now());
+                            is_established = true;
+                            info!(peer = %peer_addr, "Session established with {}", peer_addr);
+                        } else if to == FsmState::Idle {
+                            established_at = None;
+                            is_established = false;
+                        }
+                    }
+                    SessionEvent::Established { peer_asn, peer_router_id, .. } => {
+                        // Update with learned ASN
+                        update_peer_asn(&state, peer_idx, peer_asn).await;
+                        info!(
+                            peer = %peer_addr,
+                            asn = peer_asn,
+                            router_id = %peer_router_id,
+                            "Peer {} (AS{}) router-id: {}",
+                            peer_addr, peer_asn, peer_router_id
+                        );
+
+                        // Get our link-local address for the interface to use as next-hop
+                        let local_link_local = match get_interface_link_local(&peer.interface) {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                error!(
+                                    interface = peer.interface,
+                                    error = %e,
+                                    "Failed to get link-local address for {}: {}",
+                                    peer.interface, e
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Announce configured prefixes
+                        for prefix in &prefixes {
+                            if let Some(body) = announce_prefix(prefix, local_asn, local_link_local) {
+                                if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
+                                    error!(prefix = prefix, peer = %peer_addr, error = %e, "Failed to send UPDATE for {}: {}", prefix, e);
+                                } else {
+                                    debug!(prefix = prefix, peer = %peer_addr, "Announced prefix {} to {}", prefix, peer_addr);
+                                }
+                            } else {
+                                error!(prefix = prefix, "Failed to build UPDATE for prefix: {}", prefix);
+                            }
+                        }
+
+                        // Also announce any existing API routes
+                        let api_routes = rib_handle.get_api_routes().await;
+                        for route in api_routes {
+                            if let Some(body) = announce_prefix(&route.prefix, local_asn, local_link_local) {
+                                if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
+                                    error!(prefix = %route.prefix, peer = %peer_addr, error = %e, "Failed to send API route UPDATE: {}", e);
+                                } else {
+                                    debug!(prefix = %route.prefix, peer = %peer_addr, "Announced API route {} to {}", route.prefix, peer_addr);
+                                }
+                            }
+                        }
+                    }
+                    SessionEvent::SessionDown { reason } => {
+                        warn!(peer = %peer_addr, reason = reason, "Session to {} went down: {}", peer_addr, reason);
+                        update_peer_state(&state, peer_idx, bgp::SessionState::Idle).await;
+                        is_established = false;
+
+                        // Remove all routes from this peer via RibActor (no write lock needed for RIB)
+                        let removed = rib_handle.remove_peer_routes(peer_idx).await;
+
+                        // Update neighbor state
+                        {
+                            let mut s = state.write().await;
+                            if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
+                                neighbor.prefixes_received = 0;
+                            }
+                        }
+
+                        if removed > 0 {
+                            info!(peer_idx = peer_idx, routes_removed = removed, "Removed {} route(s) from peer {}", removed, peer_idx);
+                        }
+                        established_at = None;
+
+                        // Automatic reconnection after a short delay (unless shutting down)
+                        let cmd_tx_clone = cmd_tx.clone();
+                        let shutdown_rx_clone = shutdown_rx.clone();
+                        tokio::spawn(async move {
+                            // Wait before attempting reconnection (avoids tight reconnect loop)
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                            // Skip reconnection if shutdown is in progress
+                            if *shutdown_rx_clone.borrow() {
+                                debug!(peer = %peer_addr, "Skipping reconnect due to shutdown");
+                                return;
+                            }
+
+                            debug!(peer = %peer_addr, "Attempting to reconnect to peer...");
+                            match cmd_tx_clone.send(SessionCommand::Start).await {
+                                Ok(()) => debug!(peer = %peer_addr, "Reconnect command sent to {}", peer_addr),
+                                Err(e) => error!(peer = %peer_addr, error = %e, "Failed to send reconnect command: {}", e),
+                            }
+                        });
+                    }
+                    SessionEvent::UpdateReceived(data) => {
+                        // Parse UPDATE and add routes to RIB
+                        let routes = parse_update(&data);
+
+                        // Log received routes
+                        for route in &routes {
+                            debug!(
+                                peer_idx = peer_idx,
+                                prefix = %route.prefix,
+                                next_hop = %route.next_hop,
+                                as_path = ?route.as_path,
+                                "Route received: {} via {} AS_PATH {:?}",
+                                route.prefix, route.next_hop, route.as_path
+                            );
+                        }
+
+                        // Get the interface for this peer
+                        let interface = {
+                            let s = state.read().await;
+                            s.neighbors
+                                .get(peer_idx)
+                                .map(|n| n.interface.clone())
+                                .unwrap_or_default()
+                        };
+
+                        // Send routes to RibActor (no write lock needed)
+                        rib_handle.add_routes(peer_idx, routes, interface).await;
+
+                        // Update prefix count from RibActor
+                        let count = rib_handle.get_peer_stats(peer_idx).await;
+                        {
+                            let mut s = state.write().await;
+                            if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
+                                neighbor.prefixes_received = count as u64;
+                            }
+                        }
+                    }
+                }
+
+                // Update uptime
+                if let Some(started) = established_at {
+                    update_uptime(&state, peer_idx, started.elapsed().as_secs()).await;
+                }
+            }
+
+            // Handle API route events (only process if established)
+            route_event = route_events_rx.recv() => {
+                // Only advertise if we're in Established state
+                if !is_established {
+                    continue;
+                }
+
+                let Ok(event) = route_event else {
+                    // Channel lagged or closed, continue
+                    continue;
+                };
+
+                // Only process events for API routes (LOCAL_PEER_IDX)
+                match &event {
+                    RouteEvent::Added(entry) if entry.peer_idx == LOCAL_PEER_IDX => {
+                        // Get our link-local address for the interface
+                        let local_link_local = match get_interface_link_local(&peer.interface) {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                error!(interface = peer.interface, error = %e, "Failed to get link-local for API route advertisement");
+                                continue;
+                            }
+                        };
+
+                        if let Some(body) = announce_prefix(&entry.prefix, local_asn, local_link_local) {
+                            if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
+                                error!(prefix = %entry.prefix, peer = %peer_addr, error = %e, "Failed to advertise API route");
+                            } else {
+                                debug!(prefix = %entry.prefix, peer = %peer_addr, "Advertised API route to peer");
+                            }
+                        }
+                    }
+                    RouteEvent::Withdrawn { prefix, peer_idx: withdrawn_peer_idx, .. } if *withdrawn_peer_idx == LOCAL_PEER_IDX => {
+                        // TODO: Build and send withdrawal UPDATE
+                        debug!(prefix = %prefix, peer = %peer_addr, "API route withdrawal - withdrawal UPDATEs not yet implemented");
+                    }
+                    _ => {
+                        // Not an API route event, ignore
+                    }
+                }
+            }
         }
     }
 }

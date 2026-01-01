@@ -8,6 +8,21 @@ service FebgpService {
 
     // Get BGP routes
     rpc GetRoutes(Empty) returns (RoutesResponse);
+
+    // Subscribe to route updates (streaming)
+    rpc SubscribeRoutes(Empty) returns (stream RouteUpdate);
+
+    // Add a locally originated route
+    rpc AddRoute(AddRouteRequest) returns (AddRouteResponse);
+
+    // Withdraw a locally originated route
+    rpc WithdrawRoute(WithdrawRouteRequest) returns (WithdrawRouteResponse);
+
+    // Add a BGP peer dynamically
+    rpc AddPeer(AddPeerRequest) returns (AddPeerResponse);
+
+    // Remove a BGP peer dynamically
+    rpc RemovePeer(RemovePeerRequest) returns (RemovePeerResponse);
 }
 
 message Empty {}
@@ -37,4 +52,60 @@ message Route {
     string as_path = 3;
     string origin = 4;
     bool best = 5;
+    uint32 peer_id = 6;  // Peer ID (usize::MAX for locally originated routes)
+}
+
+// Route update event for streaming
+message RouteUpdate {
+    enum UpdateType {
+        ADDED = 0;
+        WITHDRAWN = 1;
+    }
+    UpdateType update_type = 1;
+    Route route = 2;
+}
+
+// Add route request
+message AddRouteRequest {
+    string prefix = 1;           // CIDR notation (e.g., "10.0.0.0/24")
+    string next_hop = 2;         // Next-hop IP address (optional, defaults to self)
+    repeated uint32 as_path = 3; // AS path to prepend (optional)
+}
+
+message AddRouteResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+// Withdraw route request
+message WithdrawRouteRequest {
+    string prefix = 1;  // CIDR notation of route to withdraw
+}
+
+message WithdrawRouteResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+// Add peer request
+message AddPeerRequest {
+    string interface = 1;    // Interface name for peering
+    string address = 2;      // Peer address (optional - if empty, use neighbor discovery)
+    uint32 remote_asn = 3;   // Remote ASN (optional - 0 means learn from OPEN)
+}
+
+message AddPeerResponse {
+    bool success = 1;
+    string error = 2;
+    uint32 peer_id = 3;      // Assigned peer ID
+}
+
+// Remove peer request
+message RemovePeerRequest {
+    uint32 peer_id = 1;
+}
+
+message RemovePeerResponse {
+    bool success = 1;
+    string error = 2;
 }
