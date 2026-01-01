@@ -38,6 +38,10 @@ enum Commands {
         /// gRPC socket path
         #[arg(long, default_value = DEFAULT_SOCKET_PATH)]
         socket: String,
+
+        /// Install routes into Linux routing table via netlink
+        #[arg(long)]
+        install_routes: bool,
     },
     /// Show neighbor status
     Status {
@@ -57,22 +61,30 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Daemon { config, socket } => run_daemon(&config, &socket),
+        Commands::Daemon { config, socket, install_routes } => {
+            run_daemon(&config, &socket, install_routes)
+        }
         Commands::Status { socket } => show_status(&socket),
         Commands::Routes { socket } => show_routes(&socket),
     }
 }
 
+mod netlink;
+
 #[tokio::main]
 async fn run_daemon_async(
     config: Config,
     socket_path: &str,
+    install_routes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("FeBGP starting...");
     println!("  ASN: {}", config.asn);
     println!("  Router ID: {}", config.router_id);
     println!("  Prefixes: {:?}", config.prefixes);
     println!("  Peers: {}", config.peers.len());
+    if install_routes {
+        println!("  Route installation: enabled");
+    }
 
     // Create shared state
     let state = Arc::new(RwLock::new(DaemonState::new(
@@ -103,7 +115,7 @@ async fn run_daemon_async(
         let peer_config = peer.clone();
 
         tokio::spawn(async move {
-            run_peer_session(peer_idx, peer_config, local_asn, router_id, state_clone).await;
+            run_peer_session(peer_idx, peer_config, local_asn, router_id, state_clone, install_routes).await;
         });
     }
 
@@ -131,7 +143,7 @@ async fn run_daemon_async(
     Ok(())
 }
 
-fn run_daemon(config_path: &str, socket_path: &str) -> ExitCode {
+fn run_daemon(config_path: &str, socket_path: &str, install_routes: bool) -> ExitCode {
     let config = match Config::from_file(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -140,7 +152,7 @@ fn run_daemon(config_path: &str, socket_path: &str) -> ExitCode {
         }
     };
 
-    if let Err(e) = run_daemon_async(config, socket_path) {
+    if let Err(e) = run_daemon_async(config, socket_path, install_routes) {
         eprintln!("Daemon error: {}", e);
         return ExitCode::FAILURE;
     }
@@ -242,6 +254,7 @@ async fn run_peer_session(
     local_asn: u32,
     router_id: std::net::Ipv4Addr,
     state: Arc<RwLock<DaemonState>>,
+    install_routes: bool,
 ) {
     // Parse peer address
     let peer_addr = match parse_peer_address(&peer) {
@@ -307,7 +320,7 @@ async fn run_peer_session(
                 println!("Session to {} went down: {}", peer_addr, reason);
                 update_peer_state(&state, peer_idx, bgp::SessionState::Idle).await;
                 // Remove all routes from this peer
-                remove_peer_routes(&state, peer_idx).await;
+                remove_peer_routes(&state, peer_idx, install_routes).await;
                 established_at = None;
             }
             SessionEvent::UpdateReceived(data) => {
@@ -316,7 +329,7 @@ async fn run_peer_session(
                 let route_count = routes.len();
 
                 for route in routes {
-                    add_route(&state, peer_idx, route).await;
+                    add_route(&state, peer_idx, route, install_routes).await;
                 }
 
                 if route_count > 0 {
@@ -404,6 +417,7 @@ async fn add_route(
     state: &Arc<RwLock<DaemonState>>,
     peer_idx: usize,
     route: bgp::ParsedRoute,
+    install_routes: bool,
 ) {
     let mut s = state.write().await;
 
@@ -418,6 +432,23 @@ async fn add_route(
     let as_path_len = route.as_path.len();
     let prefix = route.prefix.clone();
 
+    // Format next-hop with interface suffix if it's a link-local IPv6 address
+    // This is needed for route installation (RFC 5549)
+    let next_hop_str = {
+        let nh = route.next_hop.to_string();
+        // Check if it's a link-local IPv6 address (starts with fe80:)
+        if nh.starts_with("fe80:") || nh.starts_with("FE80:") {
+            // Get the interface from the neighbor config
+            if let Some(neighbor) = s.neighbors.get(peer_idx) {
+                format!("{}%{}", nh, neighbor.interface)
+            } else {
+                nh
+            }
+        } else {
+            nh
+        }
+    };
+
     // Check if we already have a route from this peer for this prefix
     let existing_from_peer = s.routes.iter_mut().find(|r| {
         r.prefix == prefix && r.peer_idx == peer_idx
@@ -425,7 +456,7 @@ async fn add_route(
 
     if let Some(existing_route) = existing_from_peer {
         // Update existing route from same peer
-        existing_route.next_hop = route.next_hop.to_string();
+        existing_route.next_hop = next_hop_str;
         existing_route.as_path = as_path_str;
         existing_route.as_path_len = as_path_len;
         existing_route.origin = route.origin.to_string();
@@ -433,7 +464,7 @@ async fn add_route(
         // Add new route
         s.routes.push(RouteEntry {
             prefix: prefix.clone(),
-            next_hop: route.next_hop.to_string(),
+            next_hop: next_hop_str,
             as_path: as_path_str,
             as_path_len,
             origin: route.origin.to_string(),
@@ -447,8 +478,45 @@ async fn add_route(
         }
     }
 
+    // Collect routes that were previously best for this prefix
+    let previously_best: Vec<(String, String)> = s
+        .routes
+        .iter()
+        .filter(|r| r.prefix == prefix && r.best)
+        .map(|r| (r.prefix.clone(), r.next_hop.clone()))
+        .collect();
+
     // Recalculate best paths for this prefix
     recalculate_best_paths(&mut s.routes, &prefix);
+
+    // If route installation is enabled, update kernel routes
+    if install_routes {
+        // Get currently best routes
+        let currently_best: Vec<(String, String)> = s
+            .routes
+            .iter()
+            .filter(|r| r.prefix == prefix && r.best)
+            .map(|r| (r.prefix.clone(), r.next_hop.clone()))
+            .collect();
+
+        // Install newly best routes
+        for (prefix, next_hop) in &currently_best {
+            if !previously_best.iter().any(|(p, nh)| p == prefix && nh == next_hop) {
+                if let Err(e) = netlink::install_route(prefix, next_hop).await {
+                    eprintln!("Failed to install route {}: {}", prefix, e);
+                }
+            }
+        }
+
+        // Remove routes that are no longer best
+        for (prefix, next_hop) in &previously_best {
+            if !currently_best.iter().any(|(p, nh)| p == prefix && nh == next_hop) {
+                if let Err(e) = netlink::remove_route(prefix, next_hop).await {
+                    eprintln!("Failed to remove route {}: {}", prefix, e);
+                }
+            }
+        }
+    }
 }
 
 /// Recalculate best paths for a given prefix.
@@ -472,30 +540,81 @@ fn recalculate_best_paths(routes: &mut [RouteEntry], prefix: &str) {
 }
 
 /// Remove all routes from a peer (called when session goes down).
-async fn remove_peer_routes(state: &Arc<RwLock<DaemonState>>, peer_idx: usize) {
+async fn remove_peer_routes(
+    state: &Arc<RwLock<DaemonState>>,
+    peer_idx: usize,
+    install_routes: bool,
+) {
     let mut s = state.write().await;
 
-    // Collect prefixes that will be affected
-    let affected_prefixes: Vec<String> = s
+    // Collect routes that will be removed (for netlink cleanup) and affected prefixes
+    let routes_to_remove: Vec<(String, String, bool)> = s
         .routes
         .iter()
         .filter(|r| r.peer_idx == peer_idx)
-        .map(|r| r.prefix.clone())
+        .map(|r| (r.prefix.clone(), r.next_hop.clone(), r.best))
         .collect();
 
+    let affected_prefixes: Vec<String> = routes_to_remove
+        .iter()
+        .map(|(p, _, _)| p.clone())
+        .collect();
+
+    // For each affected prefix, get the remaining best routes BEFORE removal
+    // (these are the routes from OTHER peers that are currently best)
+    let mut remaining_best_before: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for prefix in &affected_prefixes {
+        let best_routes: Vec<String> = s
+            .routes
+            .iter()
+            .filter(|r| r.prefix == *prefix && r.best && r.peer_idx != peer_idx)
+            .map(|r| r.next_hop.clone())
+            .collect();
+        remaining_best_before.insert(prefix.clone(), best_routes);
+    }
+
     // Remove routes from this peer
-    let removed_count = s.routes.len();
+    let removed_count = routes_to_remove.len();
     s.routes.retain(|r| r.peer_idx != peer_idx);
-    let removed_count = removed_count - s.routes.len();
 
     // Update prefix count for this neighbor
     if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
         neighbor.prefixes_received = 0;
     }
 
-    // Recalculate best paths for affected prefixes
-    for prefix in affected_prefixes {
-        recalculate_best_paths(&mut s.routes, &prefix);
+    // Recalculate best paths for affected prefixes and update kernel routes
+    for prefix in &affected_prefixes {
+        recalculate_best_paths(&mut s.routes, prefix);
+
+        if install_routes {
+            // Remove routes that were removed from this peer and were best
+            for (p, nh, was_best) in &routes_to_remove {
+                if p == prefix && *was_best {
+                    if let Err(e) = netlink::remove_route(p, nh).await {
+                        eprintln!("Failed to remove route {}: {}", p, e);
+                    }
+                }
+            }
+
+            // Get currently best routes (after recalculation)
+            let currently_best: Vec<String> = s
+                .routes
+                .iter()
+                .filter(|r| r.prefix == *prefix && r.best)
+                .map(|r| r.next_hop.clone())
+                .collect();
+
+            // Install routes that are now newly best (failover from non-best to best)
+            let previously_best = remaining_best_before.get(prefix).cloned().unwrap_or_default();
+            for next_hop in &currently_best {
+                if !previously_best.contains(next_hop) {
+                    if let Err(e) = netlink::install_route(prefix, next_hop).await {
+                        eprintln!("Failed to install failover route {}: {}", prefix, e);
+                    }
+                }
+            }
+        }
     }
 
     if removed_count > 0 {

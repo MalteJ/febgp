@@ -1424,3 +1424,738 @@ remote_asn = 65003
 
     println!("ECMP withdrawal test passed!");
 }
+
+/// Test that FeBGP installs routes into the Linux routing table when --install-routes is set.
+#[test]
+fn test_febgp_install_routes() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create two network namespaces
+    let ns1 = NetNs::new("febgp_test_ir1").expect("Failed to create namespace r1");
+    let ns2 = NetNs::new("febgp_test_ir2").expect("Failed to create namespace r2");
+
+    // Create a veth pair between them
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair");
+
+    // Wait for DAD to complete
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+
+    // Configure GoBGP
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start GoBGP
+    let gobgp = GobgpInstance::start(&ns2, &config2, 50095).expect("Failed to start GoBGP");
+
+    // Give GoBGP time to start
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Have GoBGP announce an IPv4 prefix
+    gobgp.announce_prefix_v4("10.99.0.0/24").expect("Failed to announce IPv4 prefix");
+
+    // Create FeBGP config
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_install_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_install_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+"#,
+            addr2
+        ),
+    )
+    .expect("Failed to write config");
+
+    // Start FeBGP daemon WITH --install-routes flag
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon",
+            "-c",
+            &config_path,
+            "--socket",
+            &socket_path,
+            "--install-routes",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for session to establish and routes to be received and installed
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Check the Linux routing table in ns1
+    let route_output = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            "ip",
+            "route",
+            "show",
+            "10.99.0.0/24",
+        ])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_stdout = String::from_utf8_lossy(&route_output.stdout);
+    println!("Linux routing table:\n{}", route_stdout);
+
+    // Also check FeBGP RIB for comparison
+    let routes_output = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "routes",
+            "-s",
+            &socket_path,
+        ])
+        .output()
+        .expect("Failed to run febgp routes");
+
+    let routes_stdout = String::from_utf8_lossy(&routes_output.stdout);
+    println!("FeBGP RIB:\n{}", routes_stdout);
+
+    // Kill daemon
+    let _ = daemon.kill();
+
+    // Clean up config
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Verify the route is in the Linux routing table
+    assert!(
+        route_stdout.contains("10.99.0.0/24"),
+        "Route 10.99.0.0/24 should be installed in Linux routing table. Got:\n{}",
+        route_stdout
+    );
+
+    // The route should point to the link-local next-hop via eth0
+    assert!(
+        route_stdout.contains("dev eth0"),
+        "Route should be via eth0. Got:\n{}",
+        route_stdout
+    );
+
+    println!("Route installation test passed!");
+}
+
+/// Test that FeBGP installs ECMP routes into the Linux routing table.
+#[test]
+fn test_febgp_install_routes_ecmp() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create three network namespaces (hub-and-spoke topology)
+    let ns1 = NetNs::new("febgp_test_ire1").expect("Failed to create namespace r1");
+    let ns2 = NetNs::new("febgp_test_ire2").expect("Failed to create namespace r2");
+    let ns3 = NetNs::new("febgp_test_ire3").expect("Failed to create namespace r3");
+
+    // Create veth pairs
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair 1");
+    create_veth_pair(&ns1, "eth1", &ns3, "eth0").expect("Failed to create veth pair 2");
+
+    // Wait for DAD to complete
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1_eth0 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1 eth0");
+    let addr1_eth1 = wait_for_link_local(&ns1, "eth1").expect("Failed to get link-local for r1 eth1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+    let addr3 = wait_for_link_local(&ns3, "eth0").expect("Failed to get link-local for r3");
+
+    // Configure GoBGP1 (AS 65002)
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth0),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Configure GoBGP2 (AS 65003)
+    let config3 = GobgpConfig {
+        asn: 65003,
+        router_id: Ipv4Addr::new(3, 3, 3, 3),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth1),
+            local_address: format!("{}%eth0", addr3),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start both GoBGP instances
+    let gobgp1 = GobgpInstance::start(&ns2, &config2, 50096).expect("Failed to start GoBGP1");
+    let gobgp2 = GobgpInstance::start(&ns3, &config3, 50097).expect("Failed to start GoBGP2");
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Both announce the same prefix with equal AS path length (ECMP)
+    gobgp1.announce_prefix_v4("10.88.0.0/24").expect("Failed to announce from GoBGP1");
+    gobgp2.announce_prefix_v4("10.88.0.0/24").expect("Failed to announce from GoBGP2");
+
+    // Create FeBGP config
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_ecmp_install_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_ecmp_install_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+
+[[peer]]
+interface = "eth1"
+address = "{}%eth1"
+remote_asn = 65003
+"#,
+            addr2, addr3
+        ),
+    )
+    .expect("Failed to write config");
+
+    // Start FeBGP daemon WITH --install-routes flag
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon",
+            "-c",
+            &config_path,
+            "--socket",
+            &socket_path,
+            "--install-routes",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for sessions to establish and routes to be received and installed
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Check the Linux routing table in ns1 for ECMP routes
+    let route_output = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            "ip",
+            "route",
+            "show",
+            "10.88.0.0/24",
+        ])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_stdout = String::from_utf8_lossy(&route_output.stdout);
+    println!("Linux routing table:\n{}", route_stdout);
+
+    // Also check FeBGP RIB
+    let routes_output = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "routes",
+            "-s",
+            &socket_path,
+        ])
+        .output()
+        .expect("Failed to run febgp routes");
+
+    let routes_stdout = String::from_utf8_lossy(&routes_output.stdout);
+    println!("FeBGP RIB:\n{}", routes_stdout);
+
+    // Kill daemon
+    let _ = daemon.kill();
+
+    // Clean up
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Verify ECMP: should have two routes (or one multipath route with two nexthops)
+    // Linux shows ECMP either as multiple lines or as "nexthop via ... nexthop via ..."
+    let route_count = route_stdout.lines().count();
+    let has_eth0 = route_stdout.contains("eth0");
+    let has_eth1 = route_stdout.contains("eth1");
+
+    println!("Route lines: {}, has eth0: {}, has eth1: {}", route_count, has_eth0, has_eth1);
+
+    assert!(
+        route_stdout.contains("10.88.0.0/24"),
+        "Route 10.88.0.0/24 should be installed. Got:\n{}",
+        route_stdout
+    );
+
+    assert!(
+        has_eth0 && has_eth1,
+        "ECMP: Should have routes via both eth0 and eth1. Got:\n{}",
+        route_stdout
+    );
+
+    println!("ECMP route installation test passed!");
+}
+
+/// Test that routes are removed from the Linux routing table when a peer disconnects.
+#[test]
+fn test_febgp_install_routes_removal() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create two network namespaces
+    let ns1 = NetNs::new("febgp_test_irr1").expect("Failed to create namespace r1");
+    let ns2 = NetNs::new("febgp_test_irr2").expect("Failed to create namespace r2");
+
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let addr1 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    let mut gobgp = GobgpInstance::start(&ns2, &config2, 50098).expect("Failed to start GoBGP");
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    gobgp.announce_prefix_v4("10.77.0.0/24").expect("Failed to announce prefix");
+
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_removal_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_removal_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+"#,
+            addr2
+        ),
+    )
+    .expect("Failed to write config");
+
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns", "exec", &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon", "-c", &config_path, "--socket", &socket_path, "--install-routes",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for route to be installed
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Verify route is installed
+    let route_before = Command::new("ip")
+        .args(["netns", "exec", &ns1.name, "ip", "route", "show", "10.77.0.0/24"])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_before_stdout = String::from_utf8_lossy(&route_before.stdout);
+    println!("Route BEFORE peer disconnect:\n{}", route_before_stdout);
+
+    assert!(
+        route_before_stdout.contains("10.77.0.0/24"),
+        "Route should be installed before disconnect. Got:\n{}",
+        route_before_stdout
+    );
+
+    // Kill GoBGP to simulate peer disconnect
+    println!("Stopping GoBGP...");
+    gobgp.stop();
+
+    // Wait for FeBGP to detect disconnect and remove routes
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Verify route is removed
+    let route_after = Command::new("ip")
+        .args(["netns", "exec", &ns1.name, "ip", "route", "show", "10.77.0.0/24"])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_after_stdout = String::from_utf8_lossy(&route_after.stdout);
+    println!("Route AFTER peer disconnect:\n{}", route_after_stdout);
+
+    let _ = daemon.kill();
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+
+    assert!(
+        route_after_stdout.trim().is_empty() || !route_after_stdout.contains("10.77.0.0/24"),
+        "Route should be removed after disconnect. Got:\n{}",
+        route_after_stdout
+    );
+
+    println!("Route removal test passed!");
+}
+
+/// Test ECMP withdrawal: when one peer disconnects, its route is removed but the other stays.
+#[test]
+fn test_febgp_install_routes_ecmp_withdrawal() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create three network namespaces
+    let ns1 = NetNs::new("febgp_test_irew1").expect("Failed to create namespace r1");
+    let ns2 = NetNs::new("febgp_test_irew2").expect("Failed to create namespace r2");
+    let ns3 = NetNs::new("febgp_test_irew3").expect("Failed to create namespace r3");
+
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair 1");
+    create_veth_pair(&ns1, "eth1", &ns3, "eth0").expect("Failed to create veth pair 2");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let addr1_eth0 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1 eth0");
+    let addr1_eth1 = wait_for_link_local(&ns1, "eth1").expect("Failed to get link-local for r1 eth1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+    let addr3 = wait_for_link_local(&ns3, "eth0").expect("Failed to get link-local for r3");
+
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth0),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    let config3 = GobgpConfig {
+        asn: 65003,
+        router_id: Ipv4Addr::new(3, 3, 3, 3),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth1),
+            local_address: format!("{}%eth0", addr3),
+            remote_asn: 65001,
+        }],
+    };
+
+    let gobgp1 = GobgpInstance::start(&ns2, &config2, 50099).expect("Failed to start GoBGP1");
+    let mut gobgp2 = GobgpInstance::start(&ns3, &config3, 50100).expect("Failed to start GoBGP2");
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Both announce the same prefix (ECMP)
+    gobgp1.announce_prefix_v4("10.66.0.0/24").expect("Failed to announce from GoBGP1");
+    gobgp2.announce_prefix_v4("10.66.0.0/24").expect("Failed to announce from GoBGP2");
+
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_ecmp_withdrawal_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_ecmp_withdrawal_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+
+[[peer]]
+interface = "eth1"
+address = "{}%eth1"
+remote_asn = 65003
+"#,
+            addr2, addr3
+        ),
+    )
+    .expect("Failed to write config");
+
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns", "exec", &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon", "-c", &config_path, "--socket", &socket_path, "--install-routes",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for ECMP routes to be installed
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Verify both ECMP routes are installed
+    let route_before = Command::new("ip")
+        .args(["netns", "exec", &ns1.name, "ip", "route", "show", "10.66.0.0/24"])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_before_stdout = String::from_utf8_lossy(&route_before.stdout);
+    println!("Routes BEFORE withdrawal:\n{}", route_before_stdout);
+
+    let has_eth0_before = route_before_stdout.contains("eth0");
+    let has_eth1_before = route_before_stdout.contains("eth1");
+    assert!(
+        has_eth0_before && has_eth1_before,
+        "Should have ECMP routes via both interfaces. Got:\n{}",
+        route_before_stdout
+    );
+
+    // Kill GoBGP2 (eth1) to withdraw one ECMP path
+    println!("Stopping GoBGP2 (eth1)...");
+    gobgp2.stop();
+
+    // Wait for FeBGP to detect disconnect and update routes
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Verify: eth0 route should remain, eth1 route should be gone
+    let route_after = Command::new("ip")
+        .args(["netns", "exec", &ns1.name, "ip", "route", "show", "10.66.0.0/24"])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_after_stdout = String::from_utf8_lossy(&route_after.stdout);
+    println!("Routes AFTER withdrawal:\n{}", route_after_stdout);
+
+    let _ = daemon.kill();
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Keep gobgp1 alive until we're done checking
+    drop(gobgp1);
+
+    let has_eth0_after = route_after_stdout.contains("eth0");
+    let has_eth1_after = route_after_stdout.contains("eth1");
+
+    assert!(
+        has_eth0_after,
+        "Route via eth0 should still exist. Got:\n{}",
+        route_after_stdout
+    );
+    assert!(
+        !has_eth1_after,
+        "Route via eth1 should be removed. Got:\n{}",
+        route_after_stdout
+    );
+
+    println!("ECMP withdrawal route removal test passed!");
+}
+
+/// Test that a single route becomes ECMP when a second peer announces the same prefix.
+#[test]
+fn test_febgp_install_routes_upgrade_to_ecmp() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create three network namespaces
+    let ns1 = NetNs::new("febgp_test_iru1").expect("Failed to create namespace r1");
+    let ns2 = NetNs::new("febgp_test_iru2").expect("Failed to create namespace r2");
+    let ns3 = NetNs::new("febgp_test_iru3").expect("Failed to create namespace r3");
+
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair 1");
+    create_veth_pair(&ns1, "eth1", &ns3, "eth0").expect("Failed to create veth pair 2");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let addr1_eth0 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1 eth0");
+    let addr1_eth1 = wait_for_link_local(&ns1, "eth1").expect("Failed to get link-local for r1 eth1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+    let addr3 = wait_for_link_local(&ns3, "eth0").expect("Failed to get link-local for r3");
+
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth0),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    let config3 = GobgpConfig {
+        asn: 65003,
+        router_id: Ipv4Addr::new(3, 3, 3, 3),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1_eth1),
+            local_address: format!("{}%eth0", addr3),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start both GoBGPs, but only have GoBGP1 announce initially
+    let gobgp1 = GobgpInstance::start(&ns2, &config2, 50101).expect("Failed to start GoBGP1");
+    let gobgp2 = GobgpInstance::start(&ns3, &config3, 50102).expect("Failed to start GoBGP2");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Only GoBGP1 announces the prefix initially
+    gobgp1.announce_prefix_v4("10.55.0.0/24").expect("Failed to announce from GoBGP1");
+
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_upgrade_ecmp_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_upgrade_ecmp_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+
+[[peer]]
+interface = "eth1"
+address = "{}%eth1"
+remote_asn = 65003
+"#,
+            addr2, addr3
+        ),
+    )
+    .expect("Failed to write config");
+
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns", "exec", &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon", "-c", &config_path, "--socket", &socket_path, "--install-routes",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for sessions to establish and first route to be installed
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Check: should have single route via eth0 (GoBGP2 hasn't announced yet)
+    let route_single = Command::new("ip")
+        .args(["netns", "exec", &ns1.name, "ip", "route", "show", "10.55.0.0/24"])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_single_stdout = String::from_utf8_lossy(&route_single.stdout);
+    println!("Route with SINGLE path:\n{}", route_single_stdout);
+
+    assert!(
+        route_single_stdout.contains("eth0"),
+        "Should have route via eth0. Got:\n{}",
+        route_single_stdout
+    );
+    assert!(
+        !route_single_stdout.contains("eth1"),
+        "Should NOT have route via eth1 yet. Got:\n{}",
+        route_single_stdout
+    );
+
+    // Now have GoBGP2 announce the same prefix (session already established)
+    gobgp2.announce_prefix_v4("10.55.0.0/24").expect("Failed to announce from GoBGP2");
+
+    // Wait for second route to be added (upgrade to ECMP)
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Check: should now have ECMP routes via both eth0 and eth1
+    let route_ecmp = Command::new("ip")
+        .args(["netns", "exec", &ns1.name, "ip", "route", "show", "10.55.0.0/24"])
+        .output()
+        .expect("Failed to run ip route show");
+
+    let route_ecmp_stdout = String::from_utf8_lossy(&route_ecmp.stdout);
+    println!("Route with ECMP (after second peer):\n{}", route_ecmp_stdout);
+
+    let _ = daemon.kill();
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+    drop(gobgp1);
+    drop(gobgp2);
+
+    let has_eth0 = route_ecmp_stdout.contains("eth0");
+    let has_eth1 = route_ecmp_stdout.contains("eth1");
+
+    assert!(
+        has_eth0 && has_eth1,
+        "Should have ECMP routes via both eth0 and eth1. Got:\n{}",
+        route_ecmp_stdout
+    );
+
+    println!("Upgrade to ECMP test passed!");
+}
