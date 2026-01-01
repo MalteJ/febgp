@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
+use tracing::{debug, error, info, warn};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnixListenerStream;
@@ -87,15 +88,20 @@ async fn run_daemon_async(
     socket_path: &str,
     install_routes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("FeBGP starting...");
-    println!("  ASN: {}", config.asn);
-    println!("  Router ID: {}", config.router_id);
-    println!("  Prefixes: {:?}", config.prefixes);
-    println!("  Peers: {}", config.peers.len());
-    println!("  Timers: hold={} keepalive={} connect_retry={}",
-             config.hold_time, config.hold_time / 3, config.connect_retry_time);
+    info!("FeBGP starting...");
+    info!(asn = config.asn, "ASN: {}", config.asn);
+    info!(router_id = %config.router_id, "Router ID: {}", config.router_id);
+    info!(prefixes = ?config.prefixes, "Prefixes: {:?}", config.prefixes);
+    info!(peers = config.peers.len(), "Peers: {}", config.peers.len());
+    info!(
+        hold_time = config.hold_time,
+        keepalive = config.hold_time / 3,
+        connect_retry = config.connect_retry_time,
+        "Timers: hold={} keepalive={} connect_retry={}",
+        config.hold_time, config.hold_time / 3, config.connect_retry_time
+    );
     if install_routes {
-        println!("  Route installation: enabled");
+        info!("Route installation: enabled");
     }
 
     // Create RibActor with command channel
@@ -178,20 +184,20 @@ async fn run_daemon_async(
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         let addr_key = extract_ip_addr(&peer_addr);
-                        println!("Incoming BGP connection from {}", peer_addr);
+                        debug!(peer = %peer_addr, "Incoming BGP connection from {}", peer_addr);
 
                         let map = peer_map.read().await;
                         if let Some(sender) = map.get(&addr_key) {
                             if let Err(e) = sender.send(SessionCommand::IncomingConnection(stream)).await {
-                                eprintln!("Failed to route incoming connection: {}", e);
+                                error!(peer = %peer_addr, error = %e, "Failed to route incoming connection: {}", e);
                             }
                         } else {
-                            println!("Dropping connection from unknown peer: {}", peer_addr);
+                            warn!(peer = %peer_addr, "Dropping connection from unknown peer: {}", peer_addr);
                             // stream is dropped, closing the connection
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error accepting connection: {}", e);
+                        error!(error = %e, "Error accepting connection: {}", e);
                     }
                 }
             }
@@ -212,24 +218,24 @@ async fn run_daemon_async(
 
     let service = FebgpServiceImpl::new(state);
 
-    println!("  gRPC server listening on {}", socket_path);
+    info!(socket = socket_path, "gRPC server listening on {}", socket_path);
 
     // Set up signal handlers for graceful shutdown
     let shutdown_senders = session_senders.clone();
     let shutdown_handle = tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        println!("\nReceived shutdown signal, stopping BGP sessions...");
+        info!("Received shutdown signal, stopping BGP sessions...");
 
         // Send Stop command to all sessions
         for (idx, sender) in shutdown_senders.iter().enumerate() {
             if let Err(e) = sender.send(SessionCommand::Stop).await {
-                eprintln!("Failed to send stop to session {}: {}", idx, e);
+                error!(session = idx, error = %e, "Failed to send stop to session {}: {}", idx, e);
             }
         }
 
         // Give sessions time to send NOTIFICATION and close cleanly
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        println!("Shutdown complete");
+        info!("Shutdown complete");
     });
 
     // Run gRPC server with graceful shutdown
@@ -244,16 +250,23 @@ async fn run_daemon_async(
 }
 
 fn run_daemon(config_path: &str, socket_path: &str, install_routes: bool) -> ExitCode {
+    // Initialize tracing with RUST_LOG env filter (defaults to info if not set)
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .init();
+
     let config = match Config::from_file(config_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to load config: {}", e);
+            error!("Failed to load config: {}", e);
             return ExitCode::FAILURE;
         }
     };
 
     if let Err(e) = run_daemon_async(config, socket_path, install_routes) {
-        eprintln!("Daemon error: {}", e);
+        error!("Daemon error: {}", e);
         return ExitCode::FAILURE;
     }
 
@@ -385,12 +398,12 @@ async fn run_peer_session(
     let peer_addr = match parse_peer_address(&peer) {
         Ok(addr) => addr,
         Err(e) => {
-            eprintln!("Failed to parse peer address for {}: {}", peer.interface, e);
+            error!(interface = peer.interface, error = %e, "Failed to parse peer address for {}: {}", peer.interface, e);
             return;
         }
     };
 
-    println!("Starting BGP session to {} via {}", peer_addr, peer.interface);
+    info!(peer = %peer_addr, interface = peer.interface, "Starting BGP session to {} via {}", peer_addr, peer.interface);
 
     // Create FSM configuration
     let fsm_config = FsmConfig {
@@ -413,7 +426,7 @@ async fn run_peer_session(
 
     // Send start command
     if let Err(e) = cmd_tx.send(SessionCommand::Start).await {
-        eprintln!("Failed to start session for {}: {}", peer.interface, e);
+        error!(interface = peer.interface, error = %e, "Failed to start session for {}: {}", peer.interface, e);
         return;
     }
 
@@ -427,7 +440,7 @@ async fn run_peer_session(
 
                 if to == FsmState::Established {
                     established_at = Some(Instant::now());
-                    println!("Session established with {}", peer_addr);
+                    info!(peer = %peer_addr, "Session established with {}", peer_addr);
                 } else if to == FsmState::Idle {
                     established_at = None;
                 }
@@ -435,7 +448,10 @@ async fn run_peer_session(
             SessionEvent::Established { peer_asn, peer_router_id, .. } => {
                 // Update with learned ASN
                 update_peer_asn(&state, peer_idx, peer_asn).await;
-                println!(
+                info!(
+                    peer = %peer_addr,
+                    asn = peer_asn,
+                    router_id = %peer_router_id,
                     "Peer {} (AS{}) router-id: {}",
                     peer_addr, peer_asn, peer_router_id
                 );
@@ -452,17 +468,17 @@ async fn run_peer_session(
 
                     if let Some(body) = update_body {
                         if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
-                            eprintln!("Failed to send UPDATE for {}: {}", prefix, e);
+                            error!(prefix = prefix, peer = %peer_addr, error = %e, "Failed to send UPDATE for {}: {}", prefix, e);
                         } else {
-                            println!("Announced prefix {} to {}", prefix, peer_addr);
+                            debug!(prefix = prefix, peer = %peer_addr, "Announced prefix {} to {}", prefix, peer_addr);
                         }
                     } else {
-                        eprintln!("Failed to build UPDATE for prefix: {}", prefix);
+                        error!(prefix = prefix, "Failed to build UPDATE for prefix: {}", prefix);
                     }
                 }
             }
             SessionEvent::SessionDown { reason } => {
-                println!("Session to {} went down: {}", peer_addr, reason);
+                warn!(peer = %peer_addr, reason = reason, "Session to {} went down: {}", peer_addr, reason);
                 update_peer_state(&state, peer_idx, bgp::SessionState::Idle).await;
 
                 // Remove all routes from this peer via RibActor (no write lock needed for RIB)
@@ -477,7 +493,7 @@ async fn run_peer_session(
                 }
 
                 if removed > 0 {
-                    println!("Removed {} route(s) from peer {}", removed, peer_idx);
+                    info!(peer_idx = peer_idx, routes_removed = removed, "Removed {} route(s) from peer {}", removed, peer_idx);
                 }
                 established_at = None;
 
@@ -486,10 +502,10 @@ async fn run_peer_session(
                 tokio::spawn(async move {
                     // Wait before attempting reconnection (avoids tight reconnect loop)
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    println!("Attempting to reconnect to peer...");
+                    debug!(peer = %peer_addr, "Attempting to reconnect to peer...");
                     match cmd_tx_clone.send(SessionCommand::Start).await {
-                        Ok(()) => println!("Reconnect command sent to {}", peer_addr),
-                        Err(e) => eprintln!("Failed to send reconnect command: {}", e),
+                        Ok(()) => debug!(peer = %peer_addr, "Reconnect command sent to {}", peer_addr),
+                        Err(e) => error!(peer = %peer_addr, error = %e, "Failed to send reconnect command: {}", e),
                     }
                 });
             }
@@ -520,7 +536,7 @@ async fn run_peer_session(
                 }
 
                 if route_count > 0 {
-                    println!("Received {} route(s) from peer {}", route_count, peer_idx);
+                    debug!(peer_idx = peer_idx, routes = route_count, "Received {} route(s) from peer {}", route_count, peer_idx);
                 }
             }
         }

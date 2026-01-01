@@ -567,4 +567,139 @@ mod tests {
             "192.168.1.1"
         );
     }
+
+    // Helper for creating test routes
+    fn test_route(prefix: &str, next_hop: &str, as_path: Vec<u32>) -> ParsedRoute {
+        use crate::bgp::update::Origin;
+        use std::net::IpAddr;
+        ParsedRoute {
+            prefix: prefix.to_string(),
+            next_hop: next_hop.parse::<IpAddr>().unwrap(),
+            as_path,
+            origin: Origin::Igp,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rib_add_route_single() {
+        let mut rib = Rib::new();
+        let route = test_route("10.0.0.0/24", "192.168.1.1", vec![65001]);
+
+        let (to_install, to_remove) = rib.add_route(0, route, "eth0").await;
+
+        assert_eq!(rib.routes().len(), 1);
+        assert!(rib.routes()[0].best);
+        assert_eq!(rib.routes()[0].prefix, "10.0.0.0/24");
+        assert_eq!(to_install.len(), 1);
+        assert_eq!(to_install[0].0, "10.0.0.0/24");
+        assert!(to_remove.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rib_add_route_shorter_path_wins() {
+        let mut rib = Rib::new();
+
+        // Add route with longer AS path first
+        let route1 = test_route("10.0.0.0/24", "192.168.1.1", vec![65001, 65002]);
+        rib.add_route(0, route1, "eth0").await;
+        assert!(rib.routes()[0].best);
+
+        // Add route with shorter AS path from different peer
+        let route2 = test_route("10.0.0.0/24", "192.168.1.2", vec![65003]);
+        let (to_install, to_remove) = rib.add_route(1, route2, "eth0").await;
+
+        assert_eq!(rib.routes().len(), 2);
+        // First route should no longer be best
+        let route_peer0 = rib.routes().iter().find(|r| r.peer_idx == 0).unwrap();
+        assert!(!route_peer0.best);
+        // Second route should be best
+        let route_peer1 = rib.routes().iter().find(|r| r.peer_idx == 1).unwrap();
+        assert!(route_peer1.best);
+        // Should install new best, remove old best
+        assert_eq!(to_install.len(), 1);
+        assert_eq!(to_remove.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rib_add_route_ecmp() {
+        let mut rib = Rib::new();
+
+        // Add two routes with equal AS path length
+        let route1 = test_route("10.0.0.0/24", "192.168.1.1", vec![65001]);
+        rib.add_route(0, route1, "eth0").await;
+
+        let route2 = test_route("10.0.0.0/24", "192.168.1.2", vec![65002]);
+        let (to_install, _) = rib.add_route(1, route2, "eth0").await;
+
+        assert_eq!(rib.routes().len(), 2);
+        // Both routes should be best (ECMP)
+        assert!(rib.routes().iter().all(|r| r.best));
+        // Second route should be installed (first was already installed)
+        assert_eq!(to_install.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rib_add_route_updates_existing() {
+        let mut rib = Rib::new();
+
+        // Add route from peer 0
+        let route1 = test_route("10.0.0.0/24", "192.168.1.1", vec![65001]);
+        rib.add_route(0, route1, "eth0").await;
+
+        // Update route from same peer with different next-hop
+        let route2 = test_route("10.0.0.0/24", "192.168.1.99", vec![65001, 65002]);
+        rib.add_route(0, route2, "eth0").await;
+
+        // Should still have only one route, not two
+        assert_eq!(rib.routes().len(), 1);
+        assert_eq!(rib.routes()[0].next_hop, "192.168.1.99");
+        assert_eq!(rib.routes()[0].as_path, "65001 65002");
+    }
+
+    #[tokio::test]
+    async fn test_rib_remove_peer_routes_basic() {
+        let mut rib = Rib::new();
+
+        // Add routes from two peers
+        let route1 = test_route("10.0.0.0/24", "192.168.1.1", vec![65001]);
+        rib.add_route(0, route1, "eth0").await;
+        let route2 = test_route("10.1.0.0/24", "192.168.1.2", vec![65002]);
+        rib.add_route(1, route2, "eth0").await;
+
+        assert_eq!(rib.routes().len(), 2);
+
+        // Remove peer 0's routes
+        let removed = rib.remove_peer_routes(0).await;
+
+        assert_eq!(removed, 1);
+        assert_eq!(rib.routes().len(), 1);
+        assert_eq!(rib.routes()[0].peer_idx, 1);
+    }
+
+    #[tokio::test]
+    async fn test_rib_remove_peer_routes_recalculates_best() {
+        let mut rib = Rib::new();
+
+        // Add short AS path from peer 0 (will be best)
+        let route1 = test_route("10.0.0.0/24", "192.168.1.1", vec![65001]);
+        rib.add_route(0, route1, "eth0").await;
+
+        // Add longer AS path from peer 1 (not best)
+        let route2 = test_route("10.0.0.0/24", "192.168.1.2", vec![65002, 65003, 65004]);
+        rib.add_route(1, route2, "eth0").await;
+
+        // Verify peer 0 is best, peer 1 is not
+        let peer0_route = rib.routes().iter().find(|r| r.peer_idx == 0).unwrap();
+        let peer1_route = rib.routes().iter().find(|r| r.peer_idx == 1).unwrap();
+        assert!(peer0_route.best);
+        assert!(!peer1_route.best);
+
+        // Remove peer 0's routes
+        rib.remove_peer_routes(0).await;
+
+        // Peer 1's route should now be best
+        assert_eq!(rib.routes().len(), 1);
+        assert!(rib.routes()[0].best);
+        assert_eq!(rib.routes()[0].peer_idx, 1);
+    }
 }

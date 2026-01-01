@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tracing::{debug, error, trace, warn};
 
 use crate::bgp::fsm::{
     AdminEvent, Fsm, FsmAction, FsmConfig, FsmEvent, FsmState, MessageEvent, NotificationError,
@@ -179,8 +180,9 @@ impl<T: BgpTransport> SessionActor<T> {
                 // Only send UPDATE if we're in Established state
                 if self.fsm.state() == FsmState::Established {
                     let bytes = Self::build_update_message(&body);
+                    debug!(peer = %self.transport.peer_addr(), msg_type = "UPDATE", len = bytes.len(), "Sending UPDATE message ({} bytes)", bytes.len());
                     if let Err(e) = self.transport.send(&bytes).await {
-                        eprintln!("Failed to send UPDATE: {}", e);
+                        error!(peer = %self.transport.peer_addr(), error = %e, "Failed to send UPDATE: {}", e);
                     }
                 }
             }
@@ -237,12 +239,43 @@ impl<T: BgpTransport> SessionActor<T> {
     async fn handle_transport_receive(&mut self, result: Result<Message, TransportError>) {
         match result {
             Ok(message) => {
-                let event = match message {
-                    Message::Open(open) => FsmEvent::Message(MessageEvent::BgpOpen(open)),
-                    Message::Keepalive => FsmEvent::Message(MessageEvent::KeepAliveMsg),
-                    Message::Update(data) => FsmEvent::Message(MessageEvent::UpdateMsg(data)),
+                let event = match &message {
+                    Message::Open(open) => {
+                        debug!(
+                            peer = %self.transport.peer_addr(),
+                            msg_type = "OPEN",
+                            asn = open.asn,
+                            router_id = %open.router_id,
+                            hold_time = open.hold_time,
+                            "Received OPEN from peer (ASN: {}, Router ID: {}, Hold Time: {})",
+                            open.asn, open.router_id, open.hold_time
+                        );
+                        FsmEvent::Message(MessageEvent::BgpOpen(open.clone()))
+                    }
+                    Message::Keepalive => {
+                        trace!(peer = %self.transport.peer_addr(), msg_type = "KEEPALIVE", "Received KEEPALIVE from peer");
+                        FsmEvent::Message(MessageEvent::KeepAliveMsg)
+                    }
+                    Message::Update(data) => {
+                        debug!(
+                            peer = %self.transport.peer_addr(),
+                            msg_type = "UPDATE",
+                            len = data.len(),
+                            "Received UPDATE from peer ({} bytes)",
+                            data.len()
+                        );
+                        FsmEvent::Message(MessageEvent::UpdateMsg(data.clone()))
+                    }
                     Message::Notification { code, subcode, data } => {
-                        FsmEvent::Message(MessageEvent::NotifMsg { code, subcode, data })
+                        warn!(
+                            peer = %self.transport.peer_addr(),
+                            msg_type = "NOTIFICATION",
+                            code = code,
+                            subcode = subcode,
+                            "Received NOTIFICATION from peer (code: {}, subcode: {})",
+                            code, subcode
+                        );
+                        FsmEvent::Message(MessageEvent::NotifMsg { code: *code, subcode: *subcode, data: data.clone() })
                     }
                 };
                 self.process_event(event).await;
@@ -257,7 +290,7 @@ impl<T: BgpTransport> SessionActor<T> {
             }
             Err(e) => {
                 // Log error and treat as connection failure
-                eprintln!("Transport error: {}", e);
+                error!(peer = %self.transport.peer_addr(), error = %e, "Transport error: {}", e);
                 self.process_event(FsmEvent::Tcp(TcpEvent::TcpConnectionFails))
                     .await;
             }
@@ -304,20 +337,38 @@ impl<T: BgpTransport> SessionActor<T> {
                 let config = self.fsm.config();
                 let open = OpenMessage::new(config.local_asn, config.hold_time, config.router_id);
                 let bytes = open.to_bytes();
+                debug!(
+                    peer = %self.transport.peer_addr(),
+                    msg_type = "OPEN",
+                    asn = config.local_asn,
+                    router_id = %config.router_id,
+                    hold_time = config.hold_time,
+                    "Sending OPEN to peer (ASN: {}, Router ID: {}, Hold Time: {})",
+                    config.local_asn, config.router_id, config.hold_time
+                );
                 if let Err(e) = self.transport.send(&bytes).await {
-                    eprintln!("Failed to send OPEN: {}", e);
+                    error!(peer = %self.transport.peer_addr(), error = %e, "Failed to send OPEN: {}", e);
                 }
             }
 
             FsmAction::SendKeepalive => {
                 let bytes = KeepaliveMessage::to_bytes();
+                trace!(peer = %self.transport.peer_addr(), msg_type = "KEEPALIVE", "Sending KEEPALIVE to peer");
                 if let Err(e) = self.transport.send(&bytes).await {
-                    eprintln!("Failed to send KEEPALIVE: {}", e);
+                    error!(peer = %self.transport.peer_addr(), error = %e, "Failed to send KEEPALIVE: {}", e);
                 }
             }
 
             FsmAction::SendNotification(err) => {
                 let bytes = Self::build_notification(&err);
+                warn!(
+                    peer = %self.transport.peer_addr(),
+                    msg_type = "NOTIFICATION",
+                    code = err.code as u8,
+                    subcode = err.subcode,
+                    "Sending NOTIFICATION to peer (code: {}, subcode: {})",
+                    err.code as u8, err.subcode
+                );
                 let _ = self.transport.send(&bytes).await;
             }
 

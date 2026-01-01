@@ -6,6 +6,7 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
+use tracing::{debug, warn};
 
 use super::{BgpTransport, TransportError, TransportResult};
 use crate::bgp::message::{Message, BGP_HEADER_LEN, BGP_MARKER};
@@ -182,6 +183,8 @@ impl BgpTransport for TcpTransport {
             let _ = self.close().await;
         }
 
+        debug!(peer = %self.peer_addr, "Connecting to BGP peer {}", self.peer_addr);
+
         // Connect with timeout
         let stream = match timeout(self.connect_timeout, async {
             if let Some(local_addr) = self.local_addr {
@@ -198,9 +201,18 @@ impl BgpTransport for TcpTransport {
         })
         .await
         {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(TransportError::ConnectionFailed(e)),
-            Err(_) => return Err(TransportError::Timeout),
+            Ok(Ok(stream)) => {
+                debug!(peer = %self.peer_addr, "TCP connection established to {}", self.peer_addr);
+                stream
+            }
+            Ok(Err(e)) => {
+                debug!(peer = %self.peer_addr, error = %e, "TCP connection failed to {}: {}", self.peer_addr, e);
+                return Err(TransportError::ConnectionFailed(e));
+            }
+            Err(_) => {
+                warn!(peer = %self.peer_addr, "TCP connection timed out to {}", self.peer_addr);
+                return Err(TransportError::Timeout);
+            }
         };
 
         // Configure the socket
@@ -229,6 +241,7 @@ impl BgpTransport for TcpTransport {
 
     async fn close(&mut self) -> TransportResult<()> {
         if let Some(mut stream) = self.stream.take() {
+            debug!(peer = %self.peer_addr, "Closing TCP connection to {}", self.peer_addr);
             let _ = stream.shutdown().await;
         }
         Ok(())
@@ -245,9 +258,11 @@ impl BgpTransport for TcpTransport {
     fn accept_incoming(&mut self, stream: TcpStream) {
         // Close any existing connection
         if let Some(old_stream) = self.stream.take() {
+            debug!(peer = %self.peer_addr, "Closing existing connection to accept incoming");
             // Just drop it - the stream will be closed
             drop(old_stream);
         }
+        debug!(peer = %self.peer_addr, "Accepting incoming TCP connection from {}", self.peer_addr);
         self.stream = Some(stream);
     }
 }
