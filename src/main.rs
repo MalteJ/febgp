@@ -520,7 +520,18 @@ async fn run_peer_session(
             SessionEvent::UpdateReceived(data) => {
                 // Parse UPDATE and add routes to RIB
                 let routes = parse_update(&data);
-                let route_count = routes.len();
+
+                // Log received routes
+                for route in &routes {
+                    debug!(
+                        peer_idx = peer_idx,
+                        prefix = %route.prefix,
+                        next_hop = %route.next_hop,
+                        as_path = ?route.as_path,
+                        "Route received: {} via {} AS_PATH {:?}",
+                        route.prefix, route.next_hop, route.as_path
+                    );
+                }
 
                 // Get the interface for this peer
                 let interface = {
@@ -541,10 +552,6 @@ async fn run_peer_session(
                     if let Some(neighbor) = s.neighbors.get_mut(peer_idx) {
                         neighbor.prefixes_received = count as u64;
                     }
-                }
-
-                if route_count > 0 {
-                    debug!(peer_idx = peer_idx, routes = route_count, "Received {} route(s) from peer {}", route_count, peer_idx);
                 }
             }
         }
