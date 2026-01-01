@@ -25,7 +25,7 @@ $(TOOLS_DIR)/gobgpd:
 	@echo "Downloaded gobgp $(GOBGP_VERSION) for $(GOBGP_ARCH)"
 
 test: tools build
-	@sudo -E cargo test -p tests-integration -- --nocapture; \
+	@sudo -E env "PATH=$$PATH" cargo test -p tests-integration -- --nocapture; \
 	status=$$?; \
 	sudo ip netns del febgp_test_r1 2>/dev/null || true; \
 	sudo ip netns del febgp_test_r2 2>/dev/null || true; \
