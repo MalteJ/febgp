@@ -194,13 +194,13 @@ impl Rib {
         if let Some(ref netlink) = self.netlink {
             for (prefix, next_hop) in &to_install {
                 if let Err(e) = netlink.install_route(prefix, next_hop).await {
-                    eprintln!("Failed to install route {}: {}", prefix, e);
+                    tracing::warn!(prefix = %prefix, error = %e, "Failed to install route");
                 }
             }
 
             for (prefix, next_hop) in &to_remove {
                 if let Err(e) = netlink.remove_route(prefix, next_hop).await {
-                    eprintln!("Failed to remove route {}: {}", prefix, e);
+                    tracing::warn!(prefix = %prefix, error = %e, "Failed to remove route");
                 }
             }
         }
@@ -254,7 +254,7 @@ impl Rib {
                 for (p, nh, was_best) in &routes_to_remove {
                     if p == prefix && *was_best {
                         if let Err(e) = netlink.remove_route(p, nh).await {
-                            eprintln!("Failed to remove route {}: {}", p, e);
+                            tracing::warn!(prefix = %p, error = %e, "Failed to remove route");
                         }
                     }
                 }
@@ -271,7 +271,7 @@ impl Rib {
                 for next_hop in &currently_best {
                     if !previously_best.contains(next_hop) {
                         if let Err(e) = netlink.install_route(prefix, next_hop).await {
-                            eprintln!("Failed to install failover route {}: {}", prefix, e);
+                            tracing::warn!(prefix = %prefix, error = %e, "Failed to install failover route");
                         }
                     }
                 }

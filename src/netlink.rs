@@ -62,7 +62,7 @@ impl NetlinkHandle {
                 install_route_v4(&self.handle, dest, prefix_len, gw).await?;
             }
             (IpAddr::V6(dest), IpAddr::V6(gw)) => {
-                install_route_v6(&self.handle, dest, prefix_len, gw).await?;
+                install_route_v6(&self.handle, dest, prefix_len, gw, interface.as_deref()).await?;
             }
             (IpAddr::V4(dest), IpAddr::V6(gw)) => {
                 // IPv4 over IPv6 next-hop (RFC 5549) - requires interface
@@ -90,7 +90,7 @@ impl NetlinkHandle {
                 remove_route_v4(&self.handle, dest, prefix_len, gw).await?;
             }
             (IpAddr::V6(dest), IpAddr::V6(gw)) => {
-                remove_route_v6(&self.handle, dest, prefix_len, gw).await?;
+                remove_route_v6(&self.handle, dest, prefix_len, gw, interface.as_deref()).await?;
             }
             (IpAddr::V4(dest), IpAddr::V6(gw)) => {
                 // IPv4 via IPv6 removal - need next-hop and interface for ECMP
@@ -142,24 +142,38 @@ async fn install_route_v4(
 
 /// Install IPv6 route with IPv6 gateway.
 /// Uses `ip route append` to support ECMP (multiple next-hops for same prefix).
+/// Interface is required for link-local next-hops (fe80::).
 async fn install_route_v6(
     _handle: &Handle,
     dest: std::net::Ipv6Addr,
     prefix_len: u8,
     gateway: std::net::Ipv6Addr,
+    interface: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
 
     let prefix = format!("{}/{}", dest, prefix_len);
     let gateway_str = gateway.to_string();
 
+    // Build arguments - include "dev <interface>" if provided (required for link-local next-hops)
+    let mut args = vec![
+        "-6", "route", "append",
+        &prefix,
+        "via", &gateway_str,
+    ];
+
+    let interface_owned: String;
+    if let Some(if_name) = interface {
+        interface_owned = if_name.to_string();
+        args.push("dev");
+        args.push(&interface_owned);
+    }
+
+    args.push("proto");
+    args.push("bgp");
+
     let output = Command::new("ip")
-        .args([
-            "-6", "route", "append",
-            &prefix,
-            "via", &gateway_str,
-            "proto", "bgp",
-        ])
+        .args(&args)
         .output()?;
 
     if !output.status.success() {
@@ -201,8 +215,11 @@ async fn remove_route_v6(
     dest: std::net::Ipv6Addr,
     prefix_len: u8,
     _gateway: std::net::Ipv6Addr,
+    _interface: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Find and delete matching routes
+    // Note: rtnetlink can delete routes without specifying the interface,
+    // even for routes with link-local next-hops
     let mut filter = RouteMessage::default();
     filter.header.address_family = AddressFamily::Inet6;
     let mut routes = handle.route().get(filter).execute();

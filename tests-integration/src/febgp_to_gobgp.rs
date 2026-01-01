@@ -2554,3 +2554,164 @@ remote_asn = 65002
 
     println!("Link flap route recovery test passed!");
 }
+
+/// Test that FeBGP installs IPv6 routes into the Linux routing table when --install-routes is set.
+/// This specifically tests the IPv6-prefix-with-IPv6-link-local-next-hop code path.
+#[test]
+fn test_febgp_install_routes_ipv6() {
+    if !is_root() {
+        eprintln!("Skipping test: requires root (run with sudo)");
+        return;
+    }
+
+    // Create two network namespaces
+    let ns1 = NetNs::new("febgp_test_v6ir1").expect("Failed to create namespace r1");
+    let ns2 = NetNs::new("febgp_test_v6ir2").expect("Failed to create namespace r2");
+
+    // Create a veth pair between them
+    create_veth_pair(&ns1, "eth0", &ns2, "eth0").expect("Failed to create veth pair");
+
+    // Wait for DAD to complete
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Get link-local addresses
+    let addr1 = wait_for_link_local(&ns1, "eth0").expect("Failed to get link-local for r1");
+    let addr2 = wait_for_link_local(&ns2, "eth0").expect("Failed to get link-local for r2");
+
+    // Configure GoBGP
+    let config2 = GobgpConfig {
+        asn: 65002,
+        router_id: Ipv4Addr::new(2, 2, 2, 2),
+        listen_port: 179,
+        neighbors: vec![GobgpNeighbor {
+            address: format!("{}%eth0", addr1),
+            local_address: format!("{}%eth0", addr2),
+            remote_asn: 65001,
+        }],
+    };
+
+    // Start GoBGP
+    let gobgp = GobgpInstance::start(&ns2, &config2, 50111).expect("Failed to start GoBGP");
+
+    // Give GoBGP time to start
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Have GoBGP announce an IPv6 prefix (this is the key difference from test_febgp_install_routes)
+    gobgp.announce_prefix("2001:db8:99::/48").expect("Failed to announce IPv6 prefix");
+
+    // Create FeBGP config - note: NO ipv4_unicast, just default IPv6
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let config_path = format!("/tmp/febgp_install_v6_test_{}.toml", std::process::id());
+    let socket_path = format!("/tmp/febgp_install_v6_test_{}.sock", std::process::id());
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"asn = 65001
+router_id = "1.1.1.1"
+prefixes = []
+
+[[peer]]
+interface = "eth0"
+address = "{}%eth0"
+remote_asn = 65002
+"#,
+            addr2
+        ),
+    )
+    .expect("Failed to write config");
+
+    // Start FeBGP daemon WITH --install-routes flag
+    let febgp_binary = workspace_root.join("target/debug/febgp");
+    let mut daemon = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "daemon",
+            "-c",
+            &config_path,
+            "--socket",
+            &socket_path,
+            "--install-routes",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to start FeBGP daemon");
+
+    // Wait for session to establish and routes to be received and installed
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    // Check the Linux routing table in ns1 for IPv6 routes
+    let route_output = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            "ip",
+            "-6",
+            "route",
+            "show",
+            "2001:db8:99::/48",
+        ])
+        .output()
+        .expect("Failed to run ip -6 route show");
+
+    let route_stdout = String::from_utf8_lossy(&route_output.stdout);
+    let route_stderr = String::from_utf8_lossy(&route_output.stderr);
+    println!("Linux IPv6 routing table:\n{}", route_stdout);
+    if !route_stderr.is_empty() {
+        println!("Route stderr:\n{}", route_stderr);
+    }
+
+    // Also check FeBGP RIB for comparison
+    let routes_output = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &ns1.name,
+            febgp_binary.to_str().unwrap(),
+            "routes",
+            "-s",
+            &socket_path,
+        ])
+        .output()
+        .expect("Failed to run febgp routes");
+
+    let routes_stdout = String::from_utf8_lossy(&routes_output.stdout);
+    println!("FeBGP RIB:\n{}", routes_stdout);
+
+    // Capture daemon output for debugging
+    let _ = daemon.kill();
+    let output = daemon.wait_with_output();
+    if let Ok(out) = output {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        println!("FeBGP daemon stderr:\n{}", stderr);
+        // Check for route installation errors
+        if stderr.contains("Failed to install route") {
+            println!("WARNING: Route installation errors detected in daemon output!");
+        }
+    }
+
+    // Clean up config
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Verify the route is in the Linux routing table
+    assert!(
+        route_stdout.contains("2001:db8:99::/48"),
+        "Route 2001:db8:99::/48 should be installed in Linux routing table. Got:\n{}",
+        route_stdout
+    );
+
+    // The route should point to the link-local next-hop via eth0
+    assert!(
+        route_stdout.contains("dev eth0"),
+        "Route should be via eth0. Got:\n{}",
+        route_stdout
+    );
+
+    println!("IPv6 route installation test passed!");
+}
