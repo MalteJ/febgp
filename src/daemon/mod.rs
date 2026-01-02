@@ -373,32 +373,54 @@ pub async fn run_peer_session(
                         }
                     }
                     SessionEvent::UpdateReceived(data) => {
-                        // Parse UPDATE and add routes to RIB
-                        let routes = parse_update(&data);
+                        // Parse UPDATE and extract routes and withdrawals
+                        let update_result = parse_update(&data);
 
-                        // Log received routes
-                        for route in &routes {
-                            debug!(
-                                peer_idx = peer_idx,
-                                prefix = %route.prefix,
-                                next_hop = %route.next_hop,
-                                as_path = ?route.as_path,
-                                "Route received: {} via {} AS_PATH {:?}",
-                                route.prefix, route.next_hop, route.as_path
-                            );
+                        // Process withdrawals first
+                        if !update_result.withdrawals.is_empty() {
+                            let prefixes: Vec<String> = update_result
+                                .withdrawals
+                                .iter()
+                                .map(|w| w.prefix.clone())
+                                .collect();
+
+                            for prefix in &prefixes {
+                                debug!(
+                                    peer_idx = peer_idx,
+                                    prefix = %prefix,
+                                    "Route withdrawn"
+                                );
+                            }
+
+                            rib_handle.withdraw_routes(peer_idx, prefixes).await;
                         }
 
-                        // Get the interface for this peer
-                        let interface = {
-                            let s = state.read().await;
-                            s.neighbors
-                                .get(peer_idx)
-                                .map(|n| n.interface.clone())
-                                .unwrap_or_default()
-                        };
+                        // Process route announcements
+                        if !update_result.routes.is_empty() {
+                            // Log received routes
+                            for route in &update_result.routes {
+                                debug!(
+                                    peer_idx = peer_idx,
+                                    prefix = %route.prefix,
+                                    next_hop = %route.next_hop,
+                                    as_path = ?route.as_path,
+                                    "Route received: {} via {} AS_PATH {:?}",
+                                    route.prefix, route.next_hop, route.as_path
+                                );
+                            }
 
-                        // Send routes to RibActor (no write lock needed)
-                        rib_handle.add_routes(peer_idx, routes, interface).await;
+                            // Get the interface for this peer
+                            let interface = {
+                                let s = state.read().await;
+                                s.neighbors
+                                    .get(peer_idx)
+                                    .map(|n| n.interface.clone())
+                                    .unwrap_or_default()
+                            };
+
+                            // Send routes to RibActor (no write lock needed)
+                            rib_handle.add_routes(peer_idx, update_result.routes, interface).await;
+                        }
 
                         // Update prefix count from RibActor
                         let count = rib_handle.get_peer_stats(peer_idx).await;

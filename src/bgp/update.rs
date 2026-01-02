@@ -10,7 +10,10 @@ use crate::bgp::fsm::NotificationError;
 const ATTR_ORIGIN: u8 = 1;
 const ATTR_AS_PATH: u8 = 2;
 const ATTR_NEXT_HOP: u8 = 3;
+const ATTR_MULTI_EXIT_DISC: u8 = 4;
+const ATTR_LOCAL_PREF: u8 = 5;
 const ATTR_MP_REACH_NLRI: u8 = 14;
+const ATTR_MP_UNREACH_NLRI: u8 = 15;
 
 /// A parsed BGP route from an UPDATE message
 #[derive(Debug, Clone)]
@@ -19,6 +22,10 @@ pub struct ParsedRoute {
     pub next_hop: IpAddr,
     pub as_path: Vec<u32>,
     pub origin: Origin,
+    /// LOCAL_PREF attribute (None if not present, typically for eBGP)
+    pub local_pref: Option<u32>,
+    /// Multi-Exit Discriminator (MED) attribute
+    pub med: Option<u32>,
 }
 
 /// BGP ORIGIN attribute values
@@ -39,31 +46,53 @@ impl std::fmt::Display for Origin {
     }
 }
 
-/// Parse a BGP UPDATE message body and extract routes
-pub fn parse_update(data: &Bytes) -> Vec<ParsedRoute> {
-    let mut routes = Vec::new();
+/// A parsed route withdrawal from an UPDATE message.
+#[derive(Debug, Clone)]
+pub struct ParsedWithdrawal {
+    pub prefix: String,
+}
+
+/// Result of parsing a BGP UPDATE message.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateResult {
+    /// Routes being announced.
+    pub routes: Vec<ParsedRoute>,
+    /// Prefixes being withdrawn.
+    pub withdrawals: Vec<ParsedWithdrawal>,
+}
+
+/// Parse a BGP UPDATE message body and extract routes and withdrawals.
+pub fn parse_update(data: &Bytes) -> UpdateResult {
+    let mut result = UpdateResult::default();
     let mut buf = data.clone();
 
     if buf.remaining() < 4 {
-        return routes;
+        return result;
     }
 
     // Withdrawn Routes Length
     let withdrawn_len = buf.get_u16() as usize;
     if buf.remaining() < withdrawn_len {
-        return routes;
+        return result;
     }
-    buf.advance(withdrawn_len);
+
+    // Parse IPv4 withdrawn routes (traditional format)
+    if withdrawn_len > 0 {
+        let withdrawn_data = buf.copy_to_bytes(withdrawn_len);
+        for prefix in parse_ipv4_nlri(&withdrawn_data) {
+            result.withdrawals.push(ParsedWithdrawal { prefix });
+        }
+    }
 
     if buf.remaining() < 2 {
-        return routes;
+        return result;
     }
 
     // Total Path Attribute Length
     let path_attr_len = buf.get_u16() as usize;
 
     if buf.remaining() < path_attr_len {
-        return routes;
+        return result;
     }
 
     // Split the buffer: path attributes and then NLRI
@@ -74,6 +103,8 @@ pub fn parse_update(data: &Bytes) -> Vec<ParsedRoute> {
     let mut origin = Origin::Incomplete;
     let mut as_path: Vec<u32> = Vec::new();
     let mut next_hop_v4: Option<Ipv4Addr> = None;
+    let mut local_pref: Option<u32> = None;
+    let mut med: Option<u32> = None;
     let mut mp_reach_v4: Vec<(String, IpAddr)> = Vec::new(); // (prefix, next_hop)
     let mut mp_reach_v6: Vec<(String, IpAddr)> = Vec::new();
 
@@ -126,6 +157,28 @@ pub fn parse_update(data: &Bytes) -> Vec<ParsedRoute> {
                     ));
                 }
             }
+            4 => {
+                // MULTI_EXIT_DISC (MED)
+                if attr_data.len() >= 4 {
+                    med = Some(u32::from_be_bytes([
+                        attr_data[0],
+                        attr_data[1],
+                        attr_data[2],
+                        attr_data[3],
+                    ]));
+                }
+            }
+            5 => {
+                // LOCAL_PREF
+                if attr_data.len() >= 4 {
+                    local_pref = Some(u32::from_be_bytes([
+                        attr_data[0],
+                        attr_data[1],
+                        attr_data[2],
+                        attr_data[3],
+                    ]));
+                }
+            }
             14 => {
                 // MP_REACH_NLRI
                 if attr_data.len() >= 5 {
@@ -155,6 +208,12 @@ pub fn parse_update(data: &Bytes) -> Vec<ParsedRoute> {
                     }
                 }
             }
+            15 => {
+                // MP_UNREACH_NLRI
+                for prefix in parse_mp_unreach_nlri(&attr_data) {
+                    result.withdrawals.push(ParsedWithdrawal { prefix });
+                }
+            }
             _ => {}
         }
     }
@@ -166,39 +225,45 @@ pub fn parse_update(data: &Bytes) -> Vec<ParsedRoute> {
             .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
         for prefix in parse_ipv4_nlri(&nlri_data.copy_to_bytes(nlri_data.remaining())) {
-            routes.push(ParsedRoute {
+            result.routes.push(ParsedRoute {
                 prefix,
                 next_hop,
                 as_path: as_path.clone(),
                 origin,
+                local_pref,
+                med,
             });
         }
     }
 
     // Add MP_REACH routes
     for (prefix, next_hop) in mp_reach_v4 {
-        routes.push(ParsedRoute {
+        result.routes.push(ParsedRoute {
             prefix,
             next_hop,
             as_path: as_path.clone(),
             origin,
+            local_pref,
+            med,
         });
     }
     for (prefix, next_hop) in mp_reach_v6 {
-        routes.push(ParsedRoute {
+        result.routes.push(ParsedRoute {
             prefix,
             next_hop,
             as_path: as_path.clone(),
             origin,
+            local_pref,
+            med,
         });
     }
 
-    routes
+    result
 }
 
 /// Validate and parse a BGP UPDATE message body.
 ///
-/// Returns `Ok(routes)` if the UPDATE is valid, or `Err(NotificationError)` if
+/// Returns `Ok(UpdateResult)` if the UPDATE is valid, or `Err(NotificationError)` if
 /// validation fails. Per RFC 4271 Section 6.3, validation includes:
 /// - Well-formed attribute list (correct lengths)
 /// - Presence of mandatory well-known attributes (ORIGIN, AS_PATH for routes)
@@ -207,8 +272,8 @@ pub fn parse_update(data: &Bytes) -> Vec<ParsedRoute> {
 /// - Valid NLRI prefix lengths
 ///
 /// Note: Empty UPDATEs (no routes, only withdrawals or keepalive-equivalent) are valid.
-pub fn validate_and_parse_update(data: &Bytes) -> Result<Vec<ParsedRoute>, NotificationError> {
-    let mut routes = Vec::new();
+pub fn validate_and_parse_update(data: &Bytes) -> Result<UpdateResult, NotificationError> {
+    let mut result = UpdateResult::default();
     let mut buf = data.clone();
 
     // Minimum UPDATE message body is 4 bytes (withdrawn_len + path_attr_len)
@@ -221,8 +286,14 @@ pub fn validate_and_parse_update(data: &Bytes) -> Result<Vec<ParsedRoute>, Notif
     if buf.remaining() < withdrawn_len {
         return Err(NotificationError::malformed_attribute_list());
     }
-    // Skip withdrawn routes for now (TODO: process withdrawals)
-    buf.advance(withdrawn_len);
+
+    // Parse IPv4 withdrawn routes (traditional format)
+    if withdrawn_len > 0 {
+        let withdrawn_data = buf.copy_to_bytes(withdrawn_len);
+        for prefix in parse_ipv4_nlri(&withdrawn_data) {
+            result.withdrawals.push(ParsedWithdrawal { prefix });
+        }
+    }
 
     if buf.remaining() < 2 {
         return Err(NotificationError::malformed_attribute_list());
@@ -249,6 +320,8 @@ pub fn validate_and_parse_update(data: &Bytes) -> Result<Vec<ParsedRoute>, Notif
     let mut origin = Origin::Incomplete;
     let mut as_path: Vec<u32> = Vec::new();
     let mut next_hop_v4: Option<Ipv4Addr> = None;
+    let mut local_pref: Option<u32> = None;
+    let mut med: Option<u32> = None;
     let mut mp_reach_v4: Vec<(String, IpAddr)> = Vec::new();
     let mut mp_reach_v6: Vec<(String, IpAddr)> = Vec::new();
 
@@ -304,6 +377,28 @@ pub fn validate_and_parse_update(data: &Bytes) -> Result<Vec<ParsedRoute>, Notif
                 }
                 next_hop_v4 = Some(nh);
             }
+            ATTR_MULTI_EXIT_DISC => {
+                // MED - 4 bytes
+                if attr_data.len() >= 4 {
+                    med = Some(u32::from_be_bytes([
+                        attr_data[0],
+                        attr_data[1],
+                        attr_data[2],
+                        attr_data[3],
+                    ]));
+                }
+            }
+            ATTR_LOCAL_PREF => {
+                // LOCAL_PREF - 4 bytes
+                if attr_data.len() >= 4 {
+                    local_pref = Some(u32::from_be_bytes([
+                        attr_data[0],
+                        attr_data[1],
+                        attr_data[2],
+                        attr_data[3],
+                    ]));
+                }
+            }
             ATTR_MP_REACH_NLRI => {
                 has_mp_reach = true;
                 if attr_data.len() < 5 {
@@ -339,6 +434,12 @@ pub fn validate_and_parse_update(data: &Bytes) -> Result<Vec<ParsedRoute>, Notif
                     }
                 }
             }
+            ATTR_MP_UNREACH_NLRI => {
+                // MP_UNREACH_NLRI - withdrawn routes
+                for prefix in parse_mp_unreach_nlri(&attr_data) {
+                    result.withdrawals.push(ParsedWithdrawal { prefix });
+                }
+            }
             _ => {
                 // Unknown attributes are ignored (optional non-transitive)
                 // or passed through (optional transitive)
@@ -370,34 +471,40 @@ pub fn validate_and_parse_update(data: &Bytes) -> Result<Vec<ParsedRoute>, Notif
             .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
         for prefix in validate_ipv4_nlri(&nlri_data.copy_to_bytes(nlri_data.remaining()))? {
-            routes.push(ParsedRoute {
+            result.routes.push(ParsedRoute {
                 prefix,
                 next_hop,
                 as_path: as_path.clone(),
                 origin,
+                local_pref,
+                med,
             });
         }
     }
 
     // Add MP_REACH routes
     for (prefix, next_hop) in mp_reach_v4 {
-        routes.push(ParsedRoute {
+        result.routes.push(ParsedRoute {
             prefix,
             next_hop,
             as_path: as_path.clone(),
             origin,
+            local_pref,
+            med,
         });
     }
     for (prefix, next_hop) in mp_reach_v6 {
-        routes.push(ParsedRoute {
+        result.routes.push(ParsedRoute {
             prefix,
             next_hop,
             as_path: as_path.clone(),
             origin,
+            local_pref,
+            med,
         });
     }
 
-    Ok(routes)
+    Ok(result)
 }
 
 /// Validate and parse AS_PATH attribute.
@@ -612,6 +719,41 @@ fn parse_ipv6_nlri(data: &Bytes) -> Vec<String> {
     }
 
     prefixes
+}
+
+/// Parse MP_UNREACH_NLRI attribute for IPv4/IPv6 withdrawals.
+///
+/// RFC 4760 Section 4:
+/// ```text
+/// +---------------------------------------------------------+
+/// | Address Family Identifier (2 octets)                    |
+/// +---------------------------------------------------------+
+/// | Subsequent Address Family Identifier (1 octet)          |
+/// +---------------------------------------------------------+
+/// | Withdrawn Routes (variable)                             |
+/// +---------------------------------------------------------+
+/// ```
+fn parse_mp_unreach_nlri(attr_data: &Bytes) -> Vec<String> {
+    if attr_data.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut buf = attr_data.clone();
+    let afi = buf.get_u16();
+    let safi = buf.get_u8();
+
+    // Only process unicast (SAFI 1)
+    if safi != 1 {
+        return Vec::new();
+    }
+
+    let nlri = buf; // Remaining bytes are withdrawn NLRI
+
+    match afi {
+        1 => parse_ipv4_nlri(&nlri), // IPv4 unicast
+        2 => parse_ipv6_nlri(&nlri), // IPv6 unicast
+        _ => Vec::new(),
+    }
 }
 
 /// Build a BGP UPDATE message body for an IPv4 prefix using MP_REACH_NLRI (RFC 5549).
@@ -832,7 +974,9 @@ mod tests {
         let data = Bytes::from_static(&[0, 0, 0, 0]);
         let result = validate_and_parse_update(&data);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        let update = result.unwrap();
+        assert!(update.routes.is_empty());
+        assert!(update.withdrawals.is_empty());
     }
 
     #[test]

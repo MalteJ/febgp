@@ -100,6 +100,10 @@ pub struct RouteEntry {
     pub origin: Origin,
     pub peer_idx: usize,
     pub best: bool,
+    /// LOCAL_PREF attribute (default 100 for routes without LOCAL_PREF).
+    pub local_pref: u32,
+    /// Multi-Exit Discriminator (MED) attribute.
+    pub med: Option<u32>,
 }
 
 /// Commands sent to the RibActor.
@@ -120,6 +124,11 @@ pub enum RibCommand {
     RemovePeerRoutes {
         peer_idx: usize,
         response: oneshot::Sender<usize>,
+    },
+    /// Withdraw specific routes from a peer (from UPDATE message).
+    WithdrawRoutes {
+        peer_idx: usize,
+        prefixes: Vec<String>,
     },
     /// Get all routes (for gRPC get_routes).
     GetRoutes {
@@ -243,6 +252,8 @@ impl Rib {
             origin: Origin::Igp,
             peer_idx: LOCAL_PEER_IDX,
             best: true,
+            local_pref: 100,
+            med: None,
         };
 
         self.api_routes.push(entry.clone());
@@ -299,26 +310,21 @@ impl Rib {
     ///
     /// If the RIB was created with `with_netlink()`, routes will be automatically
     /// installed/removed from the kernel.
-    ///
-    /// Returns the routes that need to be installed/removed from the kernel:
-    /// - `to_install`: Routes that are now best but weren't before
-    /// - `to_remove`: Routes that were best but aren't anymore
-    pub async fn add_route(
-        &mut self,
-        peer_idx: usize,
-        route: ParsedRoute,
-        interface: &str,
-    ) -> (Vec<(IpNet, NextHop)>, Vec<(IpNet, NextHop)>) {
+    pub async fn add_route(&mut self, peer_idx: usize, route: ParsedRoute, interface: &str) {
         // Parse prefix - if invalid, log and skip
         let prefix: IpNet = match route.prefix.parse() {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(prefix = %route.prefix, error = %e, "Invalid prefix, skipping");
-                return (vec![], vec![]);
+                return;
             }
         };
 
         let next_hop = NextHop::new(route.next_hop, interface);
+        let as_path = route.as_path;
+        let origin = route.origin;
+        let local_pref = route.local_pref.unwrap_or(100);
+        let med = route.med;
 
         // Get or create the route list for this prefix
         let prefix_routes = self.routes.entry(prefix).or_default();
@@ -327,68 +333,40 @@ impl Rib {
         let existing = prefix_routes.iter_mut().find(|r| r.peer_idx == peer_idx);
 
         if let Some(existing_route) = existing {
-            existing_route.next_hop = next_hop.clone();
-            existing_route.as_path = route.as_path.clone();
-            existing_route.origin = route.origin;
+            existing_route.next_hop = next_hop;
+            existing_route.as_path = as_path;
+            existing_route.origin = origin;
+            existing_route.local_pref = local_pref;
+            existing_route.med = med;
         } else {
             prefix_routes.push(RouteEntry {
                 prefix,
-                next_hop: next_hop.clone(),
-                as_path: route.as_path.clone(),
-                origin: route.origin,
+                next_hop,
+                as_path,
+                origin,
                 peer_idx,
                 best: false,
+                local_pref,
+                med,
             });
         }
-
-        // Collect routes that were previously best for this prefix
-        let previously_best: Vec<(IpNet, NextHop)> = self
-            .routes
-            .get(&prefix)
-            .map(|routes| {
-                routes
-                    .iter()
-                    .filter(|r| r.best)
-                    .map(|r| (r.prefix, r.next_hop.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
 
         // Recalculate best paths for this prefix
         Self::recalculate_best_paths_for_prefix(&mut self.routes, &prefix);
 
-        // Get currently best routes for this prefix
-        let currently_best: Vec<(IpNet, NextHop)> = self
-            .routes
-            .get(&prefix)
-            .map(|routes| {
-                routes
-                    .iter()
-                    .filter(|r| r.best)
-                    .map(|r| (r.prefix, r.next_hop.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Calculate diff for return value
-        let to_install: Vec<(IpNet, NextHop)> = currently_best
-            .iter()
-            .filter(|(p, nh)| !previously_best.iter().any(|(pp, pnh)| pp == p && pnh == nh))
-            .cloned()
-            .collect();
-
-        let to_remove: Vec<(IpNet, NextHop)> = previously_best
-            .iter()
-            .filter(|(p, nh)| !currently_best.iter().any(|(cp, cnh)| cp == p && cnh == nh))
-            .cloned()
-            .collect();
-
-        // Update kernel route with all current nexthops (multipath/replace)
+        // Update kernel route with all current best nexthops (multipath/replace)
         if let Some(ref netlink) = self.netlink {
-            let nexthops: Vec<String> = currently_best
-                .iter()
-                .map(|(_, nh)| nh.to_string_with_interface())
-                .collect();
+            let nexthops: Vec<String> = self
+                .routes
+                .get(&prefix)
+                .map(|routes| {
+                    routes
+                        .iter()
+                        .filter(|r| r.best)
+                        .map(|r| r.next_hop.to_string_with_interface())
+                        .collect()
+                })
+                .unwrap_or_default();
 
             let prefix_str = prefix.to_string();
             if nexthops.is_empty() {
@@ -399,8 +377,6 @@ impl Rib {
                 tracing::warn!(prefix = %prefix, error = %e, "Failed to set route");
             }
         }
-
-        (to_install, to_remove)
     }
 
     /// Remove all routes from a peer (called when session goes down).
@@ -469,18 +445,213 @@ impl Rib {
         removed_count
     }
 
-    /// Recalculate best paths for a given prefix.
-    /// Shorter AS path wins. Equal AS path length = ECMP (all marked as best).
-    fn recalculate_best_paths_for_prefix(routes: &mut HashMap<IpNet, Vec<RouteEntry>>, prefix: &IpNet) {
-        if let Some(prefix_routes) = routes.get_mut(prefix) {
-            let min_as_path_len = prefix_routes.iter().map(|r| r.as_path.len()).min();
+    /// Withdraw specific routes from a peer (from UPDATE message).
+    ///
+    /// This is different from `remove_peer_routes` which removes all routes from a peer.
+    /// This method removes only the specified prefixes.
+    ///
+    /// Returns the number of routes removed.
+    pub async fn withdraw_routes(&mut self, peer_idx: usize, prefixes: &[String]) -> usize {
+        let mut removed_count = 0;
 
-            if let Some(min_len) = min_as_path_len {
-                for route in prefix_routes.iter_mut() {
-                    route.best = route.as_path.len() == min_len;
+        for prefix_str in prefixes {
+            let prefix: IpNet = match prefix_str.parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(prefix = %prefix_str, "Invalid withdrawal prefix, skipping");
+                    continue;
+                }
+            };
+
+            // Get routes for this prefix and remove the one from this peer
+            if let Some(routes) = self.routes.get_mut(&prefix) {
+                let before = routes.len();
+                routes.retain(|r| r.peer_idx != peer_idx);
+                removed_count += before - routes.len();
+
+                if routes.is_empty() {
+                    // No more routes for this prefix - remove from kernel
+                    if let Some(ref netlink) = self.netlink {
+                        if let Err(e) = netlink.remove_prefix(prefix_str).await {
+                            tracing::warn!(prefix = %prefix, error = %e, "Failed to remove prefix");
+                        }
+                    }
+                    self.routes.remove(&prefix);
+                } else {
+                    // Recalculate best paths for remaining routes
+                    Self::recalculate_best_paths_for_prefix(&mut self.routes, &prefix);
+
+                    // Update kernel with new best paths
+                    if let Some(ref netlink) = self.netlink {
+                        let nexthops: Vec<String> = self
+                            .routes
+                            .get(&prefix)
+                            .map(|routes| {
+                                routes
+                                    .iter()
+                                    .filter(|r| r.best)
+                                    .map(|r| r.next_hop.to_string_with_interface())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        if let Err(e) = netlink.set_route(prefix_str, &nexthops).await {
+                            tracing::warn!(prefix = %prefix, error = %e, "Failed to update route");
+                        }
+                    }
                 }
             }
         }
+
+        removed_count
+    }
+
+    /// Recalculate best paths for a given prefix using RFC 4271 Section 9.1.2.2 decision process.
+    ///
+    /// Decision process order:
+    /// 1. Highest LOCAL_PREF (higher is better)
+    /// 2. Locally originated routes (peer_idx == LOCAL_PEER_IDX)
+    /// 3. Shortest AS_PATH
+    /// 4. Lowest ORIGIN type (IGP=0 < EGP=1 < INCOMPLETE=2)
+    /// 5. Lowest MED (only when comparing routes from same neighbor AS)
+    /// 6. ECMP for remaining equal routes
+    fn recalculate_best_paths_for_prefix(
+        routes: &mut HashMap<IpNet, Vec<RouteEntry>>,
+        prefix: &IpNet,
+    ) {
+        let Some(prefix_routes) = routes.get_mut(prefix) else {
+            return;
+        };
+
+        if prefix_routes.is_empty() {
+            return;
+        }
+
+        // First, mark all as not best
+        for route in prefix_routes.iter_mut() {
+            route.best = false;
+        }
+
+        // Find the best route(s) using RFC 4271 decision process
+        let best_indices = Self::select_best_route_indices(prefix_routes);
+
+        for idx in best_indices {
+            if let Some(route) = prefix_routes.get_mut(idx) {
+                route.best = true;
+            }
+        }
+    }
+
+    /// Select best route indices using RFC 4271 Section 9.1.2.2 decision process.
+    /// Returns indices of all equally-best routes (for ECMP).
+    fn select_best_route_indices(routes: &[RouteEntry]) -> Vec<usize> {
+        if routes.is_empty() {
+            return vec![];
+        }
+
+        // Start with all routes as candidates
+        let mut candidates: Vec<usize> = (0..routes.len()).collect();
+
+        // Step 1: Find highest LOCAL_PREF
+        let max_local_pref = candidates
+            .iter()
+            .map(|&i| routes[i].local_pref)
+            .max()
+            .unwrap();
+        candidates.retain(|&i| routes[i].local_pref == max_local_pref);
+
+        if candidates.len() == 1 {
+            return candidates;
+        }
+
+        // Step 2: Prefer locally originated routes
+        let local_candidates: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&i| routes[i].peer_idx == LOCAL_PEER_IDX)
+            .collect();
+
+        if !local_candidates.is_empty() {
+            candidates = local_candidates;
+        }
+
+        if candidates.len() == 1 {
+            return candidates;
+        }
+
+        // Step 3: Shortest AS_PATH
+        let min_as_path_len = candidates
+            .iter()
+            .map(|&i| routes[i].as_path.len())
+            .min()
+            .unwrap();
+        candidates.retain(|&i| routes[i].as_path.len() == min_as_path_len);
+
+        if candidates.len() == 1 {
+            return candidates;
+        }
+
+        // Step 4: Lowest ORIGIN type (IGP=0 < EGP=1 < INCOMPLETE=2)
+        let min_origin = candidates
+            .iter()
+            .map(|&i| Self::origin_preference(&routes[i].origin))
+            .min()
+            .unwrap();
+        candidates.retain(|&i| Self::origin_preference(&routes[i].origin) == min_origin);
+
+        if candidates.len() == 1 {
+            return candidates;
+        }
+
+        // Step 5: Lowest MED (only when comparing routes from same neighbor AS)
+        candidates = Self::apply_med_comparison(routes, candidates);
+
+        // Remaining candidates are ECMP
+        candidates
+    }
+
+    /// Convert Origin to numeric preference (lower is better per RFC 4271).
+    fn origin_preference(origin: &Origin) -> u8 {
+        match origin {
+            Origin::Igp => 0,
+            Origin::Egp => 1,
+            Origin::Incomplete => 2,
+        }
+    }
+
+    /// Apply MED comparison within groups of routes from the same neighbor AS.
+    fn apply_med_comparison(routes: &[RouteEntry], candidates: Vec<usize>) -> Vec<usize> {
+        use std::collections::HashMap as StdHashMap;
+
+        // Group candidates by neighbor AS (first AS in path, or 0 if empty)
+        let mut groups: StdHashMap<u32, Vec<usize>> = StdHashMap::new();
+        for &idx in &candidates {
+            let neighbor_as = routes[idx].as_path.first().copied().unwrap_or(0);
+            groups.entry(neighbor_as).or_default().push(idx);
+        }
+
+        // For each group with >1 route, select lowest MED
+        let mut result = Vec::new();
+        for group in groups.into_values() {
+            if group.len() == 1 {
+                result.extend(group);
+            } else {
+                // Find lowest MED in this group (None treated as 0 per common practice)
+                let min_med = group
+                    .iter()
+                    .map(|&i| routes[i].med.unwrap_or(0))
+                    .min()
+                    .unwrap();
+                result.extend(
+                    group
+                        .iter()
+                        .copied()
+                        .filter(|&i| routes[i].med.unwrap_or(0) == min_med),
+                );
+            }
+        }
+
+        result
     }
 
     /// Remove all installed BGP routes from the kernel.
@@ -606,6 +777,29 @@ impl RibActor {
                     // Response channel closed means requester gave up - not an error
                     let _ = response.send(count);
                 }
+                RibCommand::WithdrawRoutes { peer_idx, prefixes } => {
+                    // Collect routes to be withdrawn before removal
+                    let withdrawn: Vec<_> = prefixes.iter()
+                        .filter_map(|p| p.parse::<IpNet>().ok())
+                        .filter_map(|prefix| {
+                            self.rib.find_route(&prefix, peer_idx)
+                                .map(|r| (r.prefix, r.next_hop.clone()))
+                        })
+                        .collect();
+
+                    let _count = self.rib.withdraw_routes(peer_idx, &prefixes).await;
+
+                    // Emit withdrawn events
+                    for (prefix, next_hop) in withdrawn {
+                        if self.event_tx.send(RouteEvent::Withdrawn {
+                            prefix,
+                            next_hop,
+                            peer_idx,
+                        }).is_err() {
+                            tracing::trace!("No route event subscribers");
+                        }
+                    }
+                }
                 RibCommand::GetRoutes { response } => {
                     let routes = self.rib.routes();
                     let _ = response.send(routes);
@@ -723,6 +917,14 @@ impl RibHandle {
                 routes,
                 interface,
             })
+            .await;
+    }
+
+    /// Withdraw specific routes from a peer (fire-and-forget).
+    pub async fn withdraw_routes(&self, peer_idx: usize, prefixes: Vec<String>) {
+        let _ = self
+            .sender
+            .send(RibCommand::WithdrawRoutes { peer_idx, prefixes })
             .await;
     }
 
@@ -869,6 +1071,8 @@ mod tests {
             origin: Origin::Igp,
             peer_idx,
             best: false,
+            local_pref: 100,
+            med: None,
         }
     }
 
@@ -940,6 +1144,8 @@ mod tests {
             next_hop: next_hop.parse().unwrap(),
             as_path,
             origin: Origin::Igp,
+            local_pref: None,
+            med: None,
         }
     }
 
@@ -948,15 +1154,12 @@ mod tests {
         let mut rib = Rib::new();
         let route = test_route("10.0.0.0/24", "192.168.1.1", vec![65001]);
 
-        let (to_install, to_remove) = rib.add_route(0, route, "eth0").await;
+        rib.add_route(0, route, "eth0").await;
 
         assert_eq!(rib.route_count(), 1);
         let routes = rib.routes();
         assert!(routes[0].best);
         assert_eq!(routes[0].prefix, prefix("10.0.0.0/24"));
-        assert_eq!(to_install.len(), 1);
-        assert_eq!(to_install[0].0, prefix("10.0.0.0/24"));
-        assert!(to_remove.is_empty());
     }
 
     #[tokio::test]
@@ -970,16 +1173,13 @@ mod tests {
 
         // Add route with shorter AS path from different peer
         let route2 = test_route("10.0.0.0/24", "192.168.1.2", vec![65003]);
-        let (to_install, to_remove) = rib.add_route(1, route2, "eth0").await;
+        rib.add_route(1, route2, "eth0").await;
 
         assert_eq!(rib.route_count(), 2);
         // First route should no longer be best
         assert!(!rib.find_route(&prefix("10.0.0.0/24"), 0).unwrap().best);
         // Second route should be best
         assert!(rib.find_route(&prefix("10.0.0.0/24"), 1).unwrap().best);
-        // Should install new best, remove old best
-        assert_eq!(to_install.len(), 1);
-        assert_eq!(to_remove.len(), 1);
     }
 
     #[tokio::test]
@@ -991,13 +1191,11 @@ mod tests {
         rib.add_route(0, route1, "eth0").await;
 
         let route2 = test_route("10.0.0.0/24", "192.168.1.2", vec![65002]);
-        let (to_install, _) = rib.add_route(1, route2, "eth0").await;
+        rib.add_route(1, route2, "eth0").await;
 
         assert_eq!(rib.route_count(), 2);
         // Both routes should be best (ECMP)
         assert!(rib.iter_routes().all(|r| r.best));
-        // Second route should be installed (first was already installed)
-        assert_eq!(to_install.len(), 1);
     }
 
     #[tokio::test]
