@@ -105,10 +105,10 @@ impl FebgpService for FebgpServiceImpl {
             .await
             .iter()
             .map(|r| Route {
-                prefix: r.prefix.clone(),
-                next_hop: r.next_hop.clone(),
+                prefix: r.prefix.to_string(),
+                next_hop: r.next_hop.to_string_with_interface(),
                 as_path: r.as_path.clone(),
-                origin: r.origin.clone(),
+                origin: r.origin.to_string(),
                 best: r.best,
                 peer_id: r.peer_idx as u32,
             })
@@ -141,10 +141,10 @@ impl FebgpService for FebgpServiceImpl {
                         RouteEvent::Added(entry) => RouteUpdate {
                             update_type: UpdateType::Added.into(),
                             route: Some(Route {
-                                prefix: entry.prefix,
-                                next_hop: entry.next_hop,
-                                as_path: entry.as_path,
-                                origin: entry.origin,
+                                prefix: entry.prefix.to_string(),
+                                next_hop: entry.next_hop.to_string_with_interface(),
+                                as_path: entry.as_path.clone(),
+                                origin: entry.origin.to_string(),
                                 best: entry.best,
                                 peer_id: entry.peer_idx as u32,
                             }),
@@ -156,9 +156,9 @@ impl FebgpService for FebgpServiceImpl {
                         } => RouteUpdate {
                             update_type: UpdateType::Withdrawn.into(),
                             route: Some(Route {
-                                prefix,
-                                next_hop,
-                                as_path: String::new(),
+                                prefix: prefix.to_string(),
+                                next_hop: next_hop.to_string_with_interface(),
+                                as_path: vec![],
                                 origin: String::new(),
                                 best: false,
                                 peer_id: peer_idx as u32,
@@ -167,10 +167,10 @@ impl FebgpService for FebgpServiceImpl {
                         RouteEvent::BestChanged(entry) => RouteUpdate {
                             update_type: UpdateType::Added.into(),
                             route: Some(Route {
-                                prefix: entry.prefix,
-                                next_hop: entry.next_hop,
-                                as_path: entry.as_path,
-                                origin: entry.origin,
+                                prefix: entry.prefix.to_string(),
+                                next_hop: entry.next_hop.to_string_with_interface(),
+                                as_path: entry.as_path.clone(),
+                                origin: entry.origin.to_string(),
                                 best: entry.best,
                                 peer_id: entry.peer_idx as u32,
                             }),

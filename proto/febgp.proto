@@ -49,7 +49,7 @@ message RoutesResponse {
 message Route {
     string prefix = 1;
     string next_hop = 2;
-    string as_path = 3;
+    repeated uint32 as_path = 3;  // AS path as list of ASNs
     string origin = 4;
     bool best = 5;
     uint32 peer_id = 6;  // Peer ID (usize::MAX for locally originated routes)

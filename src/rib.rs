@@ -5,8 +5,12 @@
 //! - Best path selection (shortest AS path, ECMP for equal paths)
 //! - Kernel route installation via netlink
 
+use std::net::IpAddr;
+
+use ipnet::IpNet;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::bgp::update::Origin;
 use crate::bgp::ParsedRoute;
 use crate::error::RibError;
 use crate::netlink::NetlinkHandle;
@@ -22,8 +26,8 @@ pub enum RouteEvent {
     Added(RouteEntry),
     /// A route was withdrawn from the RIB.
     Withdrawn {
-        prefix: String,
-        next_hop: String,
+        prefix: IpNet,
+        next_hop: NextHop,
         peer_idx: usize,
     },
     /// Best path changed for a prefix (includes the new best route).
@@ -47,14 +51,51 @@ pub enum ApiRouteAdvertisement {
     Withdraw { prefix: String },
 }
 
+/// Next-hop information including interface for link-local addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextHop {
+    pub addr: IpAddr,
+    pub interface: Option<String>,
+}
+
+impl NextHop {
+    /// Create a new NextHop, adding interface suffix for link-local addresses.
+    pub fn new(addr: IpAddr, interface: &str) -> Self {
+        let interface = if is_link_local(&addr) {
+            Some(interface.to_string())
+        } else {
+            None
+        };
+        Self { addr, interface }
+    }
+
+    /// Format as string with interface suffix if needed (e.g., "fe80::1%eth0").
+    pub fn to_string_with_interface(&self) -> String {
+        match &self.interface {
+            Some(iface) => format!("{}%{}", self.addr, iface),
+            None => self.addr.to_string(),
+        }
+    }
+}
+
+/// Check if an IP address is link-local.
+fn is_link_local(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            segments[0] & 0xffc0 == 0xfe80
+        }
+        IpAddr::V4(_) => false,
+    }
+}
+
 /// A route entry in the RIB.
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
-    pub prefix: String,
-    pub next_hop: String,
-    pub as_path: String,
-    pub as_path_len: usize,
-    pub origin: String,
+    pub prefix: IpNet,
+    pub next_hop: NextHop,
+    pub as_path: Vec<u32>,
+    pub origin: Origin,
     pub peer_idx: usize,
     pub best: bool,
 }
@@ -210,19 +251,17 @@ impl Rib {
         peer_idx: usize,
         route: ParsedRoute,
         interface: &str,
-    ) -> (Vec<(String, String)>, Vec<(String, String)>) {
-        let as_path_str = route
-            .as_path
-            .iter()
-            .map(|asn| asn.to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
+    ) -> (Vec<(IpNet, NextHop)>, Vec<(IpNet, NextHop)>) {
+        // Parse prefix - if invalid, log and skip
+        let prefix: IpNet = match route.prefix.parse() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(prefix = %route.prefix, error = %e, "Invalid prefix, skipping");
+                return (vec![], vec![]);
+            }
+        };
 
-        let as_path_len = route.as_path.len();
-        let prefix = route.prefix.clone();
-
-        // Format next-hop with interface suffix for link-local addresses
-        let next_hop_str = format_next_hop(&route.next_hop.to_string(), interface);
+        let next_hop = NextHop::new(route.next_hop, interface);
 
         // Check if we already have a route from this peer for this prefix
         let existing = self
@@ -231,49 +270,47 @@ impl Rib {
             .find(|r| r.prefix == prefix && r.peer_idx == peer_idx);
 
         if let Some(existing_route) = existing {
-            existing_route.next_hop = next_hop_str;
-            existing_route.as_path = as_path_str;
-            existing_route.as_path_len = as_path_len;
-            existing_route.origin = route.origin.to_string();
+            existing_route.next_hop = next_hop.clone();
+            existing_route.as_path = route.as_path.clone();
+            existing_route.origin = route.origin;
         } else {
             self.routes.push(RouteEntry {
-                prefix: prefix.clone(),
-                next_hop: next_hop_str,
-                as_path: as_path_str,
-                as_path_len,
-                origin: route.origin.to_string(),
+                prefix,
+                next_hop: next_hop.clone(),
+                as_path: route.as_path.clone(),
+                origin: route.origin,
                 peer_idx,
                 best: false,
             });
         }
 
         // Collect routes that were previously best
-        let previously_best: Vec<(String, String)> = self
+        let previously_best: Vec<(IpNet, NextHop)> = self
             .routes
             .iter()
             .filter(|r| r.prefix == prefix && r.best)
-            .map(|r| (r.prefix.clone(), r.next_hop.clone()))
+            .map(|r| (r.prefix, r.next_hop.clone()))
             .collect();
 
         // Recalculate best paths
         recalculate_best_paths(&mut self.routes, &prefix);
 
         // Get currently best routes
-        let currently_best: Vec<(String, String)> = self
+        let currently_best: Vec<(IpNet, NextHop)> = self
             .routes
             .iter()
             .filter(|r| r.prefix == prefix && r.best)
-            .map(|r| (r.prefix.clone(), r.next_hop.clone()))
+            .map(|r| (r.prefix, r.next_hop.clone()))
             .collect();
 
         // Calculate diff for return value
-        let to_install: Vec<(String, String)> = currently_best
+        let to_install: Vec<(IpNet, NextHop)> = currently_best
             .iter()
             .filter(|(p, nh)| !previously_best.iter().any(|(pp, pnh)| pp == p && pnh == nh))
             .cloned()
             .collect();
 
-        let to_remove: Vec<(String, String)> = previously_best
+        let to_remove: Vec<(IpNet, NextHop)> = previously_best
             .iter()
             .filter(|(p, nh)| !currently_best.iter().any(|(cp, cnh)| cp == p && cnh == nh))
             .cloned()
@@ -283,14 +320,15 @@ impl Rib {
         if let Some(ref netlink) = self.netlink {
             let nexthops: Vec<String> = currently_best
                 .iter()
-                .map(|(_, nh)| nh.clone())
+                .map(|(_, nh)| nh.to_string_with_interface())
                 .collect();
 
+            let prefix_str = prefix.to_string();
             if nexthops.is_empty() {
-                if let Err(e) = netlink.remove_prefix(&prefix).await {
+                if let Err(e) = netlink.remove_prefix(&prefix_str).await {
                     tracing::warn!(prefix = %prefix, error = %e, "Failed to remove prefix");
                 }
-            } else if let Err(e) = netlink.set_route(&prefix, &nexthops).await {
+            } else if let Err(e) = netlink.set_route(&prefix_str, &nexthops).await {
                 tracing::warn!(prefix = %prefix, error = %e, "Failed to set route");
             }
         }
@@ -305,21 +343,16 @@ impl Rib {
     ///
     /// Returns the number of routes removed.
     pub async fn remove_peer_routes(&mut self, peer_idx: usize) -> usize {
-        // Collect routes to remove and affected prefixes
-        let routes_to_remove: Vec<(String, String, bool)> = self
+        // Collect affected prefixes before removal
+        let affected_prefixes: Vec<IpNet> = self
             .routes
             .iter()
             .filter(|r| r.peer_idx == peer_idx)
-            .map(|r| (r.prefix.clone(), r.next_hop.clone(), r.best))
-            .collect();
-
-        let affected_prefixes: Vec<String> = routes_to_remove
-            .iter()
-            .map(|(p, _, _)| p.clone())
+            .map(|r| r.prefix)
             .collect();
 
         // Remove routes from RIB
-        let removed_count = routes_to_remove.len();
+        let removed_count = affected_prefixes.len();
         self.routes.retain(|r| r.peer_idx != peer_idx);
 
         // Recalculate best paths and update kernel for each affected prefix
@@ -332,15 +365,16 @@ impl Rib {
                     .routes
                     .iter()
                     .filter(|r| r.prefix == *prefix && r.best)
-                    .map(|r| r.next_hop.clone())
+                    .map(|r| r.next_hop.to_string_with_interface())
                     .collect();
 
+                let prefix_str = prefix.to_string();
                 if nexthops.is_empty() {
                     // No more routes for this prefix - remove from kernel
-                    if let Err(e) = netlink.remove_prefix(prefix).await {
+                    if let Err(e) = netlink.remove_prefix(&prefix_str).await {
                         tracing::warn!(prefix = %prefix, error = %e, "Failed to remove prefix");
                     }
-                } else if let Err(e) = netlink.set_route(prefix, &nexthops).await {
+                } else if let Err(e) = netlink.set_route(&prefix_str, &nexthops).await {
                     // Update with remaining nexthops (multipath/replace)
                     tracing::warn!(prefix = %prefix, error = %e, "Failed to set failover route");
                 }
@@ -369,44 +403,24 @@ impl Rib {
     }
 }
 
-/// Format next-hop with interface suffix for link-local IPv6 addresses.
-fn format_next_hop(next_hop: &str, interface: &str) -> String {
-    if next_hop.starts_with("fe80:") || next_hop.starts_with("FE80:") {
-        format!("{}%{}", next_hop, interface)
-    } else {
-        next_hop.to_string()
-    }
-}
-
 /// Validate prefix format (basic CIDR validation).
 fn is_valid_prefix(prefix: &str) -> bool {
-    let parts: Vec<&str> = prefix.split('/').collect();
-    if parts.len() != 2 {
-        return false;
-    }
-
-    // Check if it's a valid IP address
-    let ip_valid = parts[0].parse::<std::net::IpAddr>().is_ok();
-
-    // Check if prefix length is valid
-    let prefix_len_valid = parts[1].parse::<u8>().is_ok();
-
-    ip_valid && prefix_len_valid
+    prefix.parse::<IpNet>().is_ok()
 }
 
 /// Recalculate best paths for a given prefix.
 /// Shorter AS path wins. Equal AS path length = ECMP (all marked as best).
-fn recalculate_best_paths(routes: &mut [RouteEntry], prefix: &str) {
+fn recalculate_best_paths(routes: &mut [RouteEntry], prefix: &IpNet) {
     let min_as_path_len = routes
         .iter()
-        .filter(|r| r.prefix == prefix)
-        .map(|r| r.as_path_len)
+        .filter(|r| r.prefix == *prefix)
+        .map(|r| r.as_path.len())
         .min();
 
     if let Some(min_len) = min_as_path_len {
         for route in routes.iter_mut() {
-            if route.prefix == prefix {
-                route.best = route.as_path_len == min_len;
+            if route.prefix == *prefix {
+                route.best = route.as_path.len() == min_len;
             }
         }
     }
@@ -461,11 +475,13 @@ impl RibActor {
                     route,
                     interface,
                 } => {
-                    let prefix = route.prefix.clone();
-                    self.rib.add_route(peer_idx, route, &interface).await;
-                    // Emit event for the added/updated route
-                    if let Some(entry) = self.rib.routes().iter().find(|r| r.prefix == prefix && r.peer_idx == peer_idx) {
-                        let _ = self.event_tx.send(RouteEvent::Added(entry.clone()));
+                    // Parse prefix to find it after insertion
+                    if let Ok(prefix) = route.prefix.parse::<IpNet>() {
+                        self.rib.add_route(peer_idx, route, &interface).await;
+                        // Emit event for the added/updated route
+                        if let Some(entry) = self.rib.routes().iter().find(|r| r.prefix == prefix && r.peer_idx == peer_idx) {
+                            let _ = self.event_tx.send(RouteEvent::Added(entry.clone()));
+                        }
                     }
                 }
                 RibCommand::AddRoutes {
@@ -474,11 +490,12 @@ impl RibActor {
                     interface,
                 } => {
                     for route in routes {
-                        let prefix = route.prefix.clone();
-                        self.rib.add_route(peer_idx, route, &interface).await;
-                        // Emit event for each added/updated route
-                        if let Some(entry) = self.rib.routes().iter().find(|r| r.prefix == prefix && r.peer_idx == peer_idx) {
-                            let _ = self.event_tx.send(RouteEvent::Added(entry.clone()));
+                        if let Ok(prefix) = route.prefix.parse::<IpNet>() {
+                            self.rib.add_route(peer_idx, route, &interface).await;
+                            // Emit event for each added/updated route
+                            if let Some(entry) = self.rib.routes().iter().find(|r| r.prefix == prefix && r.peer_idx == peer_idx) {
+                                let _ = self.event_tx.send(RouteEvent::Added(entry.clone()));
+                            }
                         }
                     }
                 }
@@ -487,7 +504,7 @@ impl RibActor {
                     let withdrawn: Vec<_> = self.rib.routes()
                         .iter()
                         .filter(|r| r.peer_idx == peer_idx)
-                        .map(|r| (r.prefix.clone(), r.next_hop.clone()))
+                        .map(|r| (r.prefix, r.next_hop.clone()))
                         .collect();
 
                     let count = self.rib.remove_peer_routes(peer_idx).await;
@@ -515,7 +532,7 @@ impl RibActor {
                     // Collect all routes before removal for withdrawal events
                     let withdrawn: Vec<_> = self.rib.routes()
                         .iter()
-                        .map(|r| (r.prefix.clone(), r.next_hop.clone(), r.peer_idx))
+                        .map(|r| (r.prefix, r.next_hop.clone(), r.peer_idx))
                         .collect();
 
                     let count = self.rib.remove_all_routes().await;
@@ -532,32 +549,45 @@ impl RibActor {
                     let _ = response.send(count);
                 }
                 RibCommand::AddApiRoute { route, response } => {
-                    let prefix = route.prefix.clone();
+                    let prefix_str = route.prefix.clone();
                     let result = self.rib.add_api_route(route.clone());
                     if result.is_ok() {
                         // Create a RouteEntry for the API route (for event emission)
-                        let entry = RouteEntry {
-                            prefix: prefix.clone(),
-                            next_hop: route.next_hop.clone().unwrap_or_default(),
-                            as_path: route.as_path.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(" "),
-                            as_path_len: route.as_path.len(),
-                            origin: "IGP".to_string(),
-                            peer_idx: LOCAL_PEER_IDX,
-                            best: true,
-                        };
-                        let _ = self.event_tx.send(RouteEvent::Added(entry));
-                        tracing::info!(prefix = %prefix, "Added API route");
+                        if let Ok(prefix) = prefix_str.parse::<IpNet>() {
+                            let next_hop_addr = route
+                                .next_hop
+                                .as_ref()
+                                .and_then(|s| s.parse::<IpAddr>().ok())
+                                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                            let entry = RouteEntry {
+                                prefix,
+                                next_hop: NextHop { addr: next_hop_addr, interface: None },
+                                as_path: route.as_path.clone(),
+                                origin: Origin::Igp,
+                                peer_idx: LOCAL_PEER_IDX,
+                                best: true,
+                            };
+                            let _ = self.event_tx.send(RouteEvent::Added(entry));
+                        }
+                        tracing::info!(prefix = %prefix_str, "Added API route");
                     }
                     let _ = response.send(result);
                 }
                 RibCommand::WithdrawApiRoute { prefix, response } => {
                     let result = self.rib.withdraw_api_route(&prefix);
                     if let Ok(route) = &result {
-                        let _ = self.event_tx.send(RouteEvent::Withdrawn {
-                            prefix: route.prefix.clone(),
-                            next_hop: route.next_hop.clone().unwrap_or_default(),
-                            peer_idx: LOCAL_PEER_IDX,
-                        });
+                        if let Ok(prefix_net) = route.prefix.parse::<IpNet>() {
+                            let next_hop_addr = route
+                                .next_hop
+                                .as_ref()
+                                .and_then(|s| s.parse::<IpAddr>().ok())
+                                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                            let _ = self.event_tx.send(RouteEvent::Withdrawn {
+                                prefix: prefix_net,
+                                next_hop: NextHop { addr: next_hop_addr, interface: None },
+                                peer_idx: LOCAL_PEER_IDX,
+                            });
+                        }
                         tracing::info!(prefix = %route.prefix, "Withdrawn API route");
                     }
                     let _ = response.send(result.map(|_| ()));
@@ -737,110 +767,96 @@ impl RibHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bgp::update::Origin;
+
+    // Helper to create IpNet from string
+    fn prefix(s: &str) -> IpNet {
+        s.parse().unwrap()
+    }
+
+    // Helper to create NextHop from string
+    fn next_hop(addr: &str, interface: &str) -> NextHop {
+        NextHop::new(addr.parse().unwrap(), interface)
+    }
+
+    // Helper to create RouteEntry for tests
+    fn route_entry(
+        prefix_str: &str,
+        next_hop_str: &str,
+        as_path: Vec<u32>,
+        peer_idx: usize,
+    ) -> RouteEntry {
+        RouteEntry {
+            prefix: prefix(prefix_str),
+            next_hop: next_hop(next_hop_str, "eth0"),
+            as_path,
+            origin: Origin::Igp,
+            peer_idx,
+            best: false,
+        }
+    }
 
     #[test]
     fn test_recalculate_best_paths_single_route() {
-        let mut routes = vec![RouteEntry {
-            prefix: "10.0.0.0/24".to_string(),
-            next_hop: "192.168.1.1".to_string(),
-            as_path: "65001".to_string(),
-            as_path_len: 1,
-            origin: "IGP".to_string(),
-            peer_idx: 0,
-            best: false,
-        }];
+        let prefix_net = prefix("10.0.0.0/24");
+        let mut routes = vec![route_entry("10.0.0.0/24", "192.168.1.1", vec![65001], 0)];
 
-        recalculate_best_paths(&mut routes, "10.0.0.0/24");
+        recalculate_best_paths(&mut routes, &prefix_net);
         assert!(routes[0].best);
     }
 
     #[test]
     fn test_recalculate_best_paths_shorter_wins() {
+        let prefix_net = prefix("10.0.0.0/24");
         let mut routes = vec![
-            RouteEntry {
-                prefix: "10.0.0.0/24".to_string(),
-                next_hop: "192.168.1.1".to_string(),
-                as_path: "65001 65002".to_string(),
-                as_path_len: 2,
-                origin: "IGP".to_string(),
-                peer_idx: 0,
-                best: false,
-            },
-            RouteEntry {
-                prefix: "10.0.0.0/24".to_string(),
-                next_hop: "192.168.1.2".to_string(),
-                as_path: "65003".to_string(),
-                as_path_len: 1,
-                origin: "IGP".to_string(),
-                peer_idx: 1,
-                best: false,
-            },
+            route_entry("10.0.0.0/24", "192.168.1.1", vec![65001, 65002], 0),
+            route_entry("10.0.0.0/24", "192.168.1.2", vec![65003], 1),
         ];
 
-        recalculate_best_paths(&mut routes, "10.0.0.0/24");
+        recalculate_best_paths(&mut routes, &prefix_net);
         assert!(!routes[0].best); // Longer path
         assert!(routes[1].best); // Shorter path
     }
 
     #[test]
     fn test_recalculate_best_paths_ecmp() {
+        let prefix_net = prefix("10.0.0.0/24");
         let mut routes = vec![
-            RouteEntry {
-                prefix: "10.0.0.0/24".to_string(),
-                next_hop: "192.168.1.1".to_string(),
-                as_path: "65001".to_string(),
-                as_path_len: 1,
-                origin: "IGP".to_string(),
-                peer_idx: 0,
-                best: false,
-            },
-            RouteEntry {
-                prefix: "10.0.0.0/24".to_string(),
-                next_hop: "192.168.1.2".to_string(),
-                as_path: "65002".to_string(),
-                as_path_len: 1,
-                origin: "IGP".to_string(),
-                peer_idx: 1,
-                best: false,
-            },
+            route_entry("10.0.0.0/24", "192.168.1.1", vec![65001], 0),
+            route_entry("10.0.0.0/24", "192.168.1.2", vec![65002], 1),
         ];
 
-        recalculate_best_paths(&mut routes, "10.0.0.0/24");
+        recalculate_best_paths(&mut routes, &prefix_net);
         assert!(routes[0].best); // ECMP - both best
         assert!(routes[1].best);
     }
 
     #[test]
-    fn test_format_next_hop_link_local() {
-        assert_eq!(
-            format_next_hop("fe80::1", "eth0"),
-            "fe80::1%eth0"
-        );
-        assert_eq!(
-            format_next_hop("FE80::1", "eth0"),
-            "FE80::1%eth0"
-        );
+    fn test_next_hop_link_local() {
+        let nh = NextHop::new("fe80::1".parse().unwrap(), "eth0");
+        assert_eq!(nh.to_string_with_interface(), "fe80::1%eth0");
+        assert_eq!(nh.interface, Some("eth0".to_string()));
     }
 
     #[test]
-    fn test_format_next_hop_global() {
-        assert_eq!(
-            format_next_hop("2001:db8::1", "eth0"),
-            "2001:db8::1"
-        );
-        assert_eq!(
-            format_next_hop("192.168.1.1", "eth0"),
-            "192.168.1.1"
-        );
+    fn test_next_hop_global_ipv6() {
+        let nh = NextHop::new("2001:db8::1".parse().unwrap(), "eth0");
+        assert_eq!(nh.to_string_with_interface(), "2001:db8::1");
+        assert_eq!(nh.interface, None);
+    }
+
+    #[test]
+    fn test_next_hop_ipv4() {
+        let nh = NextHop::new("192.168.1.1".parse().unwrap(), "eth0");
+        assert_eq!(nh.to_string_with_interface(), "192.168.1.1");
+        assert_eq!(nh.interface, None);
     }
 
     // Helper for creating test routes
     fn test_route(prefix: &str, next_hop: &str, as_path: Vec<u32>) -> ParsedRoute {
-        use crate::bgp::update::Origin;
-        use std::net::IpAddr;
         ParsedRoute {
             prefix: prefix.to_string(),
-            next_hop: next_hop.parse::<IpAddr>().unwrap(),
+            next_hop: next_hop.parse().unwrap(),
             as_path,
             origin: Origin::Igp,
         }
@@ -855,9 +871,9 @@ mod tests {
 
         assert_eq!(rib.routes().len(), 1);
         assert!(rib.routes()[0].best);
-        assert_eq!(rib.routes()[0].prefix, "10.0.0.0/24");
+        assert_eq!(rib.routes()[0].prefix, prefix("10.0.0.0/24"));
         assert_eq!(to_install.len(), 1);
-        assert_eq!(to_install[0].0, "10.0.0.0/24");
+        assert_eq!(to_install[0].0, prefix("10.0.0.0/24"));
         assert!(to_remove.is_empty());
     }
 
@@ -918,8 +934,8 @@ mod tests {
 
         // Should still have only one route, not two
         assert_eq!(rib.routes().len(), 1);
-        assert_eq!(rib.routes()[0].next_hop, "192.168.1.99");
-        assert_eq!(rib.routes()[0].as_path, "65001 65002");
+        assert_eq!(rib.routes()[0].next_hop.addr, "192.168.1.99".parse::<IpAddr>().unwrap());
+        assert_eq!(rib.routes()[0].as_path, vec![65001, 65002]);
     }
 
     #[tokio::test]
@@ -1100,7 +1116,7 @@ mod tests {
         let event = event.unwrap().unwrap();
         match event {
             RouteEvent::Added(entry) => {
-                assert_eq!(entry.prefix, "10.0.0.0/24");
+                assert_eq!(entry.prefix, prefix("10.0.0.0/24"));
                 assert_eq!(entry.peer_idx, 0);
             }
             _ => panic!("Expected RouteEvent::Added"),
@@ -1143,7 +1159,7 @@ mod tests {
         let event = event.unwrap().unwrap();
         match event {
             RouteEvent::Added(entry) => {
-                assert_eq!(entry.prefix, "10.0.0.0/24");
+                assert_eq!(entry.prefix, prefix("10.0.0.0/24"));
                 assert_eq!(entry.peer_idx, LOCAL_PEER_IDX);
             }
             _ => panic!("Expected RouteEvent::Added"),
@@ -1190,8 +1206,8 @@ mod tests {
         assert!(event.is_ok());
         let event = event.unwrap().unwrap();
         match event {
-            RouteEvent::Withdrawn { prefix, peer_idx, .. } => {
-                assert_eq!(prefix, "10.0.0.0/24");
+            RouteEvent::Withdrawn { prefix: p, peer_idx, .. } => {
+                assert_eq!(p, prefix("10.0.0.0/24"));
                 assert_eq!(peer_idx, LOCAL_PEER_IDX);
             }
             _ => panic!("Expected RouteEvent::Withdrawn"),

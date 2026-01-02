@@ -212,9 +212,15 @@ async fn show_routes_async(socket_path: &str) -> Result<(), Box<dyn std::error::
             } else {
                 "" // ECMP path - don't repeat prefix
             };
+            let as_path_str = r
+                .as_path
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
             println!(
                 "{:<3} {:<40} {:<40} {:<20} {:<6}",
-                best, display_prefix, r.next_hop, r.as_path, r.origin
+                best, display_prefix, r.next_hop, as_path_str, r.origin
             );
         }
     }

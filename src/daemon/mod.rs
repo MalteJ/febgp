@@ -392,7 +392,7 @@ pub async fn run_peer_session(
                             }
                         };
 
-                        if let Some(body) = announce_prefix(&entry.prefix, local_asn, local_link_local) {
+                        if let Some(body) = announce_prefix(&entry.prefix.to_string(), local_asn, local_link_local) {
                             if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
                                 error!(
                                     prefix = %entry.prefix,
