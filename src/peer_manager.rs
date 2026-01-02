@@ -32,7 +32,8 @@ pub struct PeerInfo {
     pub id: u32,
     pub config: PeerConfig,
     pub peer_idx: usize,
-    pub cmd_tx: mpsc::Sender<SessionCommand>,
+    /// Command sender for the session. None if session not yet spawned.
+    pub cmd_tx: Option<mpsc::Sender<SessionCommand>>,
 }
 
 /// Commands sent to the PeerManager.
@@ -144,11 +145,12 @@ impl PeerManager {
             match cmd {
                 PeerManagerCommand::AddPeer { config, response } => {
                     let result = self.handle_add_peer(config).await;
-                    let _ = response.send(result);
+                    // Response channel closed means requester gave up - not an error
+                    drop(response.send(result));
                 }
                 PeerManagerCommand::RemovePeer { peer_id, response } => {
                     let result = self.handle_remove_peer(peer_id).await;
-                    let _ = response.send(result);
+                    drop(response.send(result));
                 }
                 PeerManagerCommand::GetPeers { response } => {
                     let peers: Vec<_> = self
@@ -156,7 +158,7 @@ impl PeerManager {
                         .iter()
                         .map(|(id, info)| (*id, info.config.clone()))
                         .collect();
-                    let _ = response.send(peers);
+                    drop(response.send(peers));
                 }
                 PeerManagerCommand::RegisterStartupPeer {
                     peer_idx,
@@ -168,7 +170,7 @@ impl PeerManager {
                         id: peer_id,
                         config,
                         peer_idx,
-                        cmd_tx,
+                        cmd_tx: Some(cmd_tx),
                     };
                     self.peers.insert(peer_id, info);
                     self.idx_to_id.insert(peer_idx, peer_id);
@@ -210,9 +212,6 @@ impl PeerManager {
         let peer_idx = self.next_peer_idx;
         self.next_peer_idx += 1;
 
-        // Create command channel for the new session
-        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>(16);
-
         // Add neighbor state to DaemonState
         {
             let mut s = self.state.write().await;
@@ -226,12 +225,12 @@ impl PeerManager {
             });
         }
 
-        // Store peer info
+        // Store peer info (no session spawned yet - cmd_tx is None)
         let info = PeerInfo {
             id: peer_id,
             config: config.clone(),
             peer_idx,
-            cmd_tx: cmd_tx.clone(),
+            cmd_tx: None, // Session spawning not yet implemented for dynamic peers
         };
         self.peers.insert(peer_id, info);
         self.idx_to_id.insert(peer_idx, peer_id);
@@ -240,12 +239,8 @@ impl PeerManager {
             peer_id = peer_id,
             interface = %config.interface,
             address = ?config.address,
-            "Added new peer dynamically"
+            "Added new peer dynamically (session spawning not yet implemented)"
         );
-
-        // Note: The actual session spawning would need to be done externally
-        // because we don't have access to the spawn logic here.
-        // The caller should spawn the session using the returned peer_id.
 
         Ok(peer_id)
     }
@@ -259,9 +254,11 @@ impl PeerManager {
 
         self.idx_to_id.remove(&info.peer_idx);
 
-        // Send stop command to the session
-        if let Err(e) = info.cmd_tx.send(SessionCommand::Stop).await {
-            tracing::warn!(peer_id = peer_id, error = %e, "Failed to send stop command to peer");
+        // Send stop command to the session if it exists
+        if let Some(cmd_tx) = &info.cmd_tx {
+            if let Err(e) = cmd_tx.send(SessionCommand::Stop).await {
+                tracing::warn!(peer_id = peer_id, error = %e, "Failed to send stop command to peer");
+            }
         }
 
         // Remove routes from this peer

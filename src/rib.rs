@@ -5,6 +5,7 @@
 //! - Best path selection (shortest AS path, ECMP for equal paths)
 //! - Kernel route installation via netlink
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -150,8 +151,12 @@ pub enum RibCommand {
 }
 
 /// The Routing Information Base.
+///
+/// Routes are stored in a HashMap keyed by prefix for O(1) prefix lookups.
+/// Each prefix maps to a Vec of routes (one per peer, supporting ECMP).
 pub struct Rib {
-    routes: Vec<RouteEntry>,
+    /// Routes indexed by prefix for O(1) lookup. Each prefix has a Vec of routes (one per peer).
+    routes: HashMap<IpNet, Vec<RouteEntry>>,
     /// Locally originated routes (added via API), stored as RouteEntry with peer_idx = LOCAL_PEER_IDX.
     api_routes: Vec<RouteEntry>,
     /// Reusable netlink handle for route installation (None if route installation disabled)
@@ -167,7 +172,8 @@ impl Default for Rib {
 impl std::fmt::Debug for Rib {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Rib")
-            .field("routes", &self.routes)
+            .field("route_count", &self.route_count())
+            .field("prefix_count", &self.routes.len())
             .field("netlink", &self.netlink.is_some())
             .finish()
     }
@@ -176,7 +182,7 @@ impl std::fmt::Debug for Rib {
 impl Rib {
     pub fn new() -> Self {
         Self {
-            routes: Vec::new(),
+            routes: HashMap::new(),
             api_routes: Vec::new(),
             netlink: None,
         }
@@ -193,10 +199,15 @@ impl Rib {
         source_v6: Option<std::net::Ipv6Addr>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
-            routes: Vec::new(),
+            routes: HashMap::new(),
             api_routes: Vec::new(),
             netlink: Some(NetlinkHandle::new(source_v4, source_v6)?),
         })
+    }
+
+    /// Total number of routes across all prefixes.
+    pub fn route_count(&self) -> usize {
+        self.routes.values().map(|v| v.len()).sum()
     }
 
     /// Get all API routes.
@@ -251,19 +262,37 @@ impl Rib {
         }
     }
 
-    /// Get all routes.
-    pub fn routes(&self) -> &[RouteEntry] {
-        &self.routes
+    /// Get all routes as a collected Vec (for iteration/display).
+    /// Note: This allocates. For large RIBs, prefer `routes_for_prefix()` or `iter_routes()`.
+    pub fn routes(&self) -> Vec<RouteEntry> {
+        self.routes.values().flatten().cloned().collect()
     }
 
-    /// Get mutable access to routes (for API compatibility during migration).
-    pub fn routes_mut(&mut self) -> &mut Vec<RouteEntry> {
-        &mut self.routes
+    /// Get routes for a specific prefix (O(1) lookup).
+    pub fn routes_for_prefix(&self, prefix: &IpNet) -> &[RouteEntry] {
+        self.routes.get(prefix).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Iterate over all routes without allocation.
+    pub fn iter_routes(&self) -> impl Iterator<Item = &RouteEntry> {
+        self.routes.values().flatten()
     }
 
     /// Count routes from a specific peer.
     pub fn count_routes_from_peer(&self, peer_idx: usize) -> usize {
-        self.routes.iter().filter(|r| r.peer_idx == peer_idx).count()
+        self.routes
+            .values()
+            .flatten()
+            .filter(|r| r.peer_idx == peer_idx)
+            .count()
+    }
+
+    /// Find a route by prefix and peer_idx.
+    pub fn find_route(&self, prefix: &IpNet, peer_idx: usize) -> Option<&RouteEntry> {
+        self.routes
+            .get(prefix)?
+            .iter()
+            .find(|r| r.peer_idx == peer_idx)
     }
 
     /// Add or update a route from a peer.
@@ -291,18 +320,18 @@ impl Rib {
 
         let next_hop = NextHop::new(route.next_hop, interface);
 
+        // Get or create the route list for this prefix
+        let prefix_routes = self.routes.entry(prefix).or_default();
+
         // Check if we already have a route from this peer for this prefix
-        let existing = self
-            .routes
-            .iter_mut()
-            .find(|r| r.prefix == prefix && r.peer_idx == peer_idx);
+        let existing = prefix_routes.iter_mut().find(|r| r.peer_idx == peer_idx);
 
         if let Some(existing_route) = existing {
             existing_route.next_hop = next_hop.clone();
             existing_route.as_path = route.as_path.clone();
             existing_route.origin = route.origin;
         } else {
-            self.routes.push(RouteEntry {
+            prefix_routes.push(RouteEntry {
                 prefix,
                 next_hop: next_hop.clone(),
                 as_path: route.as_path.clone(),
@@ -312,24 +341,34 @@ impl Rib {
             });
         }
 
-        // Collect routes that were previously best
+        // Collect routes that were previously best for this prefix
         let previously_best: Vec<(IpNet, NextHop)> = self
             .routes
-            .iter()
-            .filter(|r| r.prefix == prefix && r.best)
-            .map(|r| (r.prefix, r.next_hop.clone()))
-            .collect();
+            .get(&prefix)
+            .map(|routes| {
+                routes
+                    .iter()
+                    .filter(|r| r.best)
+                    .map(|r| (r.prefix, r.next_hop.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        // Recalculate best paths
-        recalculate_best_paths(&mut self.routes, &prefix);
+        // Recalculate best paths for this prefix
+        Self::recalculate_best_paths_for_prefix(&mut self.routes, &prefix);
 
-        // Get currently best routes
+        // Get currently best routes for this prefix
         let currently_best: Vec<(IpNet, NextHop)> = self
             .routes
-            .iter()
-            .filter(|r| r.prefix == prefix && r.best)
-            .map(|r| (r.prefix, r.next_hop.clone()))
-            .collect();
+            .get(&prefix)
+            .map(|routes| {
+                routes
+                    .iter()
+                    .filter(|r| r.best)
+                    .map(|r| (r.prefix, r.next_hop.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Calculate diff for return value
         let to_install: Vec<(IpNet, NextHop)> = currently_best
@@ -371,30 +410,48 @@ impl Rib {
     ///
     /// Returns the number of routes removed.
     pub async fn remove_peer_routes(&mut self, peer_idx: usize) -> usize {
-        // Collect affected prefixes before removal
+        // Collect affected prefixes (those that have routes from this peer)
         let affected_prefixes: Vec<IpNet> = self
             .routes
             .iter()
-            .filter(|r| r.peer_idx == peer_idx)
-            .map(|r| r.prefix)
+            .filter(|(_, routes)| routes.iter().any(|r| r.peer_idx == peer_idx))
+            .map(|(prefix, _)| *prefix)
             .collect();
 
-        // Remove routes from RIB
-        let removed_count = affected_prefixes.len();
-        self.routes.retain(|r| r.peer_idx != peer_idx);
+        let mut removed_count = 0;
 
-        // Recalculate best paths and update kernel for each affected prefix
+        // Remove routes from each affected prefix
         for prefix in &affected_prefixes {
-            recalculate_best_paths(&mut self.routes, prefix);
+            if let Some(routes) = self.routes.get_mut(prefix) {
+                let before = routes.len();
+                routes.retain(|r| r.peer_idx != peer_idx);
+                removed_count += before - routes.len();
+            }
+        }
+
+        // Clean up empty prefix entries and recalculate best paths
+        for prefix in &affected_prefixes {
+            // Remove prefix if no routes remain
+            if self.routes.get(prefix).map(|v| v.is_empty()).unwrap_or(false) {
+                self.routes.remove(prefix);
+            } else {
+                // Recalculate best paths for remaining routes
+                Self::recalculate_best_paths_for_prefix(&mut self.routes, prefix);
+            }
 
             if let Some(ref netlink) = self.netlink {
                 // Get all currently best nexthops for this prefix
                 let nexthops: Vec<String> = self
                     .routes
-                    .iter()
-                    .filter(|r| r.prefix == *prefix && r.best)
-                    .map(|r| r.next_hop.to_string_with_interface())
-                    .collect();
+                    .get(prefix)
+                    .map(|routes| {
+                        routes
+                            .iter()
+                            .filter(|r| r.best)
+                            .map(|r| r.next_hop.to_string_with_interface())
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
                 let prefix_str = prefix.to_string();
                 if nexthops.is_empty() {
@@ -412,6 +469,20 @@ impl Rib {
         removed_count
     }
 
+    /// Recalculate best paths for a given prefix.
+    /// Shorter AS path wins. Equal AS path length = ECMP (all marked as best).
+    fn recalculate_best_paths_for_prefix(routes: &mut HashMap<IpNet, Vec<RouteEntry>>, prefix: &IpNet) {
+        if let Some(prefix_routes) = routes.get_mut(prefix) {
+            let min_as_path_len = prefix_routes.iter().map(|r| r.as_path.len()).min();
+
+            if let Some(min_len) = min_as_path_len {
+                for route in prefix_routes.iter_mut() {
+                    route.best = route.as_path.len() == min_len;
+                }
+            }
+        }
+    }
+
     /// Remove all installed BGP routes from the kernel.
     ///
     /// This is called during daemon shutdown to clean up routes.
@@ -427,24 +498,6 @@ impl Rib {
             removed
         } else {
             0
-        }
-    }
-}
-
-/// Recalculate best paths for a given prefix.
-/// Shorter AS path wins. Equal AS path length = ECMP (all marked as best).
-fn recalculate_best_paths(routes: &mut [RouteEntry], prefix: &IpNet) {
-    let min_as_path_len = routes
-        .iter()
-        .filter(|r| r.prefix == *prefix)
-        .map(|r| r.as_path.len())
-        .min();
-
-    if let Some(min_len) = min_as_path_len {
-        for route in routes.iter_mut() {
-            if route.prefix == *prefix {
-                route.best = route.as_path.len() == min_len;
-            }
         }
     }
 }
@@ -505,9 +558,11 @@ impl RibActor {
                     // Parse prefix to find it after insertion
                     if let Ok(prefix) = route.prefix.parse::<IpNet>() {
                         self.rib.add_route(peer_idx, route, &interface).await;
-                        // Emit event for the added/updated route
-                        if let Some(entry) = self.rib.routes().iter().find(|r| r.prefix == prefix && r.peer_idx == peer_idx) {
-                            let _ = self.event_tx.send(RouteEvent::Added(entry.clone()));
+                        // Emit event for the added/updated route (O(1) lookup)
+                        if let Some(entry) = self.rib.find_route(&prefix, peer_idx) {
+                            if self.event_tx.send(RouteEvent::Added(entry.clone())).is_err() {
+                                tracing::trace!("No route event subscribers");
+                            }
                         }
                     }
                 }
@@ -519,17 +574,18 @@ impl RibActor {
                     for route in routes {
                         if let Ok(prefix) = route.prefix.parse::<IpNet>() {
                             self.rib.add_route(peer_idx, route, &interface).await;
-                            // Emit event for each added/updated route
-                            if let Some(entry) = self.rib.routes().iter().find(|r| r.prefix == prefix && r.peer_idx == peer_idx) {
-                                let _ = self.event_tx.send(RouteEvent::Added(entry.clone()));
+                            // Emit event for each added/updated route (O(1) lookup)
+                            if let Some(entry) = self.rib.find_route(&prefix, peer_idx) {
+                                if self.event_tx.send(RouteEvent::Added(entry.clone())).is_err() {
+                                    tracing::trace!("No route event subscribers");
+                                }
                             }
                         }
                     }
                 }
                 RibCommand::RemovePeerRoutes { peer_idx, response } => {
                     // Collect routes to be removed before removal
-                    let withdrawn: Vec<_> = self.rib.routes()
-                        .iter()
+                    let withdrawn: Vec<_> = self.rib.iter_routes()
                         .filter(|r| r.peer_idx == peer_idx)
                         .map(|r| (r.prefix, r.next_hop.clone()))
                         .collect();
@@ -538,17 +594,20 @@ impl RibActor {
 
                     // Emit withdrawn events
                     for (prefix, next_hop) in withdrawn {
-                        let _ = self.event_tx.send(RouteEvent::Withdrawn {
+                        if self.event_tx.send(RouteEvent::Withdrawn {
                             prefix,
                             next_hop,
                             peer_idx,
-                        });
+                        }).is_err() {
+                            tracing::trace!("No route event subscribers");
+                        }
                     }
 
+                    // Response channel closed means requester gave up - not an error
                     let _ = response.send(count);
                 }
                 RibCommand::GetRoutes { response } => {
-                    let routes = self.rib.routes().to_vec();
+                    let routes = self.rib.routes();
                     let _ = response.send(routes);
                 }
                 RibCommand::GetPeerStats { peer_idx, response } => {
@@ -557,8 +616,7 @@ impl RibActor {
                 }
                 RibCommand::RemoveAllRoutes { response } => {
                     // Collect all routes before removal for withdrawal events
-                    let withdrawn: Vec<_> = self.rib.routes()
-                        .iter()
+                    let withdrawn: Vec<_> = self.rib.iter_routes()
                         .map(|r| (r.prefix, r.next_hop.clone(), r.peer_idx))
                         .collect();
 
@@ -566,11 +624,13 @@ impl RibActor {
 
                     // Emit withdrawn events for all routes
                     for (prefix, next_hop, peer_idx) in withdrawn {
-                        let _ = self.event_tx.send(RouteEvent::Withdrawn {
+                        if self.event_tx.send(RouteEvent::Withdrawn {
                             prefix,
                             next_hop,
                             peer_idx,
-                        });
+                        }).is_err() {
+                            tracing::trace!("No route event subscribers");
+                        }
                     }
 
                     let _ = response.send(count);
@@ -579,7 +639,9 @@ impl RibActor {
                     let prefix_str = route.prefix.clone();
                     match self.rib.add_api_route(route) {
                         Ok(entry) => {
-                            let _ = self.event_tx.send(RouteEvent::Added(entry));
+                            if self.event_tx.send(RouteEvent::Added(entry)).is_err() {
+                                tracing::trace!("No route event subscribers");
+                            }
                             tracing::info!(prefix = %prefix_str, "Added API route");
                             let _ = response.send(Ok(()));
                         }
@@ -591,11 +653,13 @@ impl RibActor {
                 RibCommand::WithdrawApiRoute { prefix, response } => {
                     match self.rib.withdraw_api_route(&prefix) {
                         Ok(entry) => {
-                            let _ = self.event_tx.send(RouteEvent::Withdrawn {
+                            if self.event_tx.send(RouteEvent::Withdrawn {
                                 prefix: entry.prefix,
                                 next_hop: entry.next_hop,
                                 peer_idx: LOCAL_PEER_IDX,
-                            });
+                            }).is_err() {
+                                tracing::trace!("No route event subscribers");
+                            }
                             tracing::info!(prefix = %prefix, "Withdrawn API route");
                             let _ = response.send(Ok(()));
                         }
@@ -811,21 +875,24 @@ mod tests {
     #[test]
     fn test_recalculate_best_paths_single_route() {
         let prefix_net = prefix("10.0.0.0/24");
-        let mut routes = vec![route_entry("10.0.0.0/24", "192.168.1.1", vec![65001], 0)];
+        let mut routes_map: HashMap<IpNet, Vec<RouteEntry>> = HashMap::new();
+        routes_map.insert(prefix_net, vec![route_entry("10.0.0.0/24", "192.168.1.1", vec![65001], 0)]);
 
-        recalculate_best_paths(&mut routes, &prefix_net);
-        assert!(routes[0].best);
+        Rib::recalculate_best_paths_for_prefix(&mut routes_map, &prefix_net);
+        assert!(routes_map.get(&prefix_net).unwrap()[0].best);
     }
 
     #[test]
     fn test_recalculate_best_paths_shorter_wins() {
         let prefix_net = prefix("10.0.0.0/24");
-        let mut routes = vec![
+        let mut routes_map: HashMap<IpNet, Vec<RouteEntry>> = HashMap::new();
+        routes_map.insert(prefix_net, vec![
             route_entry("10.0.0.0/24", "192.168.1.1", vec![65001, 65002], 0),
             route_entry("10.0.0.0/24", "192.168.1.2", vec![65003], 1),
-        ];
+        ]);
 
-        recalculate_best_paths(&mut routes, &prefix_net);
+        Rib::recalculate_best_paths_for_prefix(&mut routes_map, &prefix_net);
+        let routes = routes_map.get(&prefix_net).unwrap();
         assert!(!routes[0].best); // Longer path
         assert!(routes[1].best); // Shorter path
     }
@@ -833,12 +900,14 @@ mod tests {
     #[test]
     fn test_recalculate_best_paths_ecmp() {
         let prefix_net = prefix("10.0.0.0/24");
-        let mut routes = vec![
+        let mut routes_map: HashMap<IpNet, Vec<RouteEntry>> = HashMap::new();
+        routes_map.insert(prefix_net, vec![
             route_entry("10.0.0.0/24", "192.168.1.1", vec![65001], 0),
             route_entry("10.0.0.0/24", "192.168.1.2", vec![65002], 1),
-        ];
+        ]);
 
-        recalculate_best_paths(&mut routes, &prefix_net);
+        Rib::recalculate_best_paths_for_prefix(&mut routes_map, &prefix_net);
+        let routes = routes_map.get(&prefix_net).unwrap();
         assert!(routes[0].best); // ECMP - both best
         assert!(routes[1].best);
     }
@@ -881,9 +950,10 @@ mod tests {
 
         let (to_install, to_remove) = rib.add_route(0, route, "eth0").await;
 
-        assert_eq!(rib.routes().len(), 1);
-        assert!(rib.routes()[0].best);
-        assert_eq!(rib.routes()[0].prefix, prefix("10.0.0.0/24"));
+        assert_eq!(rib.route_count(), 1);
+        let routes = rib.routes();
+        assert!(routes[0].best);
+        assert_eq!(routes[0].prefix, prefix("10.0.0.0/24"));
         assert_eq!(to_install.len(), 1);
         assert_eq!(to_install[0].0, prefix("10.0.0.0/24"));
         assert!(to_remove.is_empty());
@@ -896,19 +966,17 @@ mod tests {
         // Add route with longer AS path first
         let route1 = test_route("10.0.0.0/24", "192.168.1.1", vec![65001, 65002]);
         rib.add_route(0, route1, "eth0").await;
-        assert!(rib.routes()[0].best);
+        assert!(rib.find_route(&prefix("10.0.0.0/24"), 0).unwrap().best);
 
         // Add route with shorter AS path from different peer
         let route2 = test_route("10.0.0.0/24", "192.168.1.2", vec![65003]);
         let (to_install, to_remove) = rib.add_route(1, route2, "eth0").await;
 
-        assert_eq!(rib.routes().len(), 2);
+        assert_eq!(rib.route_count(), 2);
         // First route should no longer be best
-        let route_peer0 = rib.routes().iter().find(|r| r.peer_idx == 0).unwrap();
-        assert!(!route_peer0.best);
+        assert!(!rib.find_route(&prefix("10.0.0.0/24"), 0).unwrap().best);
         // Second route should be best
-        let route_peer1 = rib.routes().iter().find(|r| r.peer_idx == 1).unwrap();
-        assert!(route_peer1.best);
+        assert!(rib.find_route(&prefix("10.0.0.0/24"), 1).unwrap().best);
         // Should install new best, remove old best
         assert_eq!(to_install.len(), 1);
         assert_eq!(to_remove.len(), 1);
@@ -925,9 +993,9 @@ mod tests {
         let route2 = test_route("10.0.0.0/24", "192.168.1.2", vec![65002]);
         let (to_install, _) = rib.add_route(1, route2, "eth0").await;
 
-        assert_eq!(rib.routes().len(), 2);
+        assert_eq!(rib.route_count(), 2);
         // Both routes should be best (ECMP)
-        assert!(rib.routes().iter().all(|r| r.best));
+        assert!(rib.iter_routes().all(|r| r.best));
         // Second route should be installed (first was already installed)
         assert_eq!(to_install.len(), 1);
     }
@@ -945,9 +1013,10 @@ mod tests {
         rib.add_route(0, route2, "eth0").await;
 
         // Should still have only one route, not two
-        assert_eq!(rib.routes().len(), 1);
-        assert_eq!(rib.routes()[0].next_hop.addr, "192.168.1.99".parse::<IpAddr>().unwrap());
-        assert_eq!(rib.routes()[0].as_path, vec![65001, 65002]);
+        assert_eq!(rib.route_count(), 1);
+        let r = rib.find_route(&prefix("10.0.0.0/24"), 0).unwrap();
+        assert_eq!(r.next_hop.addr, "192.168.1.99".parse::<IpAddr>().unwrap());
+        assert_eq!(r.as_path, vec![65001, 65002]);
     }
 
     #[tokio::test]
@@ -960,14 +1029,15 @@ mod tests {
         let route2 = test_route("10.1.0.0/24", "192.168.1.2", vec![65002]);
         rib.add_route(1, route2, "eth0").await;
 
-        assert_eq!(rib.routes().len(), 2);
+        assert_eq!(rib.route_count(), 2);
 
         // Remove peer 0's routes
         let removed = rib.remove_peer_routes(0).await;
 
         assert_eq!(removed, 1);
-        assert_eq!(rib.routes().len(), 1);
-        assert_eq!(rib.routes()[0].peer_idx, 1);
+        assert_eq!(rib.route_count(), 1);
+        let routes = rib.routes();
+        assert_eq!(routes[0].peer_idx, 1);
     }
 
     #[tokio::test]
@@ -983,18 +1053,17 @@ mod tests {
         rib.add_route(1, route2, "eth0").await;
 
         // Verify peer 0 is best, peer 1 is not
-        let peer0_route = rib.routes().iter().find(|r| r.peer_idx == 0).unwrap();
-        let peer1_route = rib.routes().iter().find(|r| r.peer_idx == 1).unwrap();
-        assert!(peer0_route.best);
-        assert!(!peer1_route.best);
+        assert!(rib.find_route(&prefix("10.0.0.0/24"), 0).unwrap().best);
+        assert!(!rib.find_route(&prefix("10.0.0.0/24"), 1).unwrap().best);
 
         // Remove peer 0's routes
         rib.remove_peer_routes(0).await;
 
         // Peer 1's route should now be best
-        assert_eq!(rib.routes().len(), 1);
-        assert!(rib.routes()[0].best);
-        assert_eq!(rib.routes()[0].peer_idx, 1);
+        assert_eq!(rib.route_count(), 1);
+        let routes = rib.routes();
+        assert!(routes[0].best);
+        assert_eq!(routes[0].peer_idx, 1);
     }
 
     // Tests for API route functionality

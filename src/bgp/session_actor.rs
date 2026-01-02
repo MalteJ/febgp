@@ -413,7 +413,9 @@ impl<T: BgpTransport> SessionActor<T> {
                     "Sending NOTIFICATION to peer (code: {}, subcode: {})",
                     err.code as u8, err.subcode
                 );
-                let _ = self.transport.send(&bytes).await;
+                if let Err(e) = self.transport.send(&bytes).await {
+                    tracing::warn!(error = %e, "Failed to send NOTIFICATION to peer");
+                }
             }
 
             FsmAction::StartConnectRetryTimer => {
@@ -514,11 +516,14 @@ impl<T: BgpTransport> SessionActor<T> {
 
             FsmAction::ReleaseResources => {
                 self.timers.clear_all();
-                let _ = self.transport.close().await;
+                // Ignore close errors - we're releasing resources anyway
+                drop(self.transport.close().await);
             }
 
             FsmAction::ProcessUpdate(data) => {
-                let _ = self.event_tx.send(SessionEvent::UpdateReceived(data)).await;
+                if self.event_tx.send(SessionEvent::UpdateReceived(data)).await.is_err() {
+                    tracing::warn!(peer = %self.transport.peer_addr(), "Session event receiver dropped");
+                }
             }
         }
         None
