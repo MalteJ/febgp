@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use crate::api::server::{DaemonState, NeighborState};
 use crate::bgp::{SessionCommand, SessionState};
 use crate::config::PeerConfig;
+use crate::error::PeerManagerError;
 use crate::rib::RibHandle;
 
 /// Unique peer ID generator.
@@ -39,12 +40,12 @@ pub enum PeerManagerCommand {
     /// Add a new peer dynamically.
     AddPeer {
         config: PeerConfig,
-        response: oneshot::Sender<Result<u32, String>>,
+        response: oneshot::Sender<Result<u32, PeerManagerError>>,
     },
     /// Remove a peer by ID.
     RemovePeer {
         peer_id: u32,
-        response: oneshot::Sender<Result<(), String>>,
+        response: oneshot::Sender<Result<(), PeerManagerError>>,
     },
     /// Get all managed peers.
     GetPeers {
@@ -178,27 +179,28 @@ impl PeerManager {
     }
 
     /// Handle adding a new peer.
-    async fn handle_add_peer(&mut self, config: PeerConfig) -> Result<u32, String> {
+    async fn handle_add_peer(&mut self, config: PeerConfig) -> Result<u32, PeerManagerError> {
         // Validate the peer config
         if config.interface.is_empty() {
-            return Err("Interface is required".to_string());
+            return Err(PeerManagerError::InvalidConfig(
+                "interface is required".to_string(),
+            ));
         }
 
         // Check for duplicate peer on same interface
         for info in self.peers.values() {
             if info.config.interface == config.interface {
                 if config.address.is_none() && info.config.address.is_none() {
-                    return Err(format!(
-                        "Peer already exists on interface {} with neighbor discovery",
-                        config.interface
-                    ));
+                    return Err(PeerManagerError::PeerExists {
+                        interface: config.interface,
+                    });
                 }
                 if let (Some(addr1), Some(addr2)) = (&config.address, &info.config.address) {
                     if addr1 == addr2 {
-                        return Err(format!(
-                            "Peer already exists with address {} on interface {}",
-                            addr1, config.interface
-                        ));
+                        return Err(PeerManagerError::PeerExistsWithAddress {
+                            address: addr1.clone(),
+                            interface: config.interface,
+                        });
                     }
                 }
             }
@@ -249,10 +251,10 @@ impl PeerManager {
     }
 
     /// Handle removing a peer.
-    async fn handle_remove_peer(&mut self, peer_id: u32) -> Result<(), String> {
+    async fn handle_remove_peer(&mut self, peer_id: u32) -> Result<(), PeerManagerError> {
         let info = match self.peers.remove(&peer_id) {
             Some(info) => info,
-            None => return Err(format!("Peer {} not found", peer_id)),
+            None => return Err(PeerManagerError::PeerNotFound(peer_id)),
         };
 
         self.idx_to_id.remove(&info.peer_idx);
@@ -307,7 +309,7 @@ impl PeerManagerHandle {
     }
 
     /// Add a new peer.
-    pub async fn add_peer(&self, config: PeerConfig) -> Result<u32, String> {
+    pub async fn add_peer(&self, config: PeerConfig) -> Result<u32, PeerManagerError> {
         let (tx, rx) = oneshot::channel();
         if self
             .sender
@@ -318,14 +320,18 @@ impl PeerManagerHandle {
             .await
             .is_ok()
         {
-            rx.await.unwrap_or_else(|_| Err("Channel closed".to_string()))
+            rx.await.unwrap_or_else(|_| {
+                Err(PeerManagerError::InvalidConfig("channel closed".to_string()))
+            })
         } else {
-            Err("Failed to send command".to_string())
+            Err(PeerManagerError::InvalidConfig(
+                "failed to send command".to_string(),
+            ))
         }
     }
 
     /// Remove a peer by ID.
-    pub async fn remove_peer(&self, peer_id: u32) -> Result<(), String> {
+    pub async fn remove_peer(&self, peer_id: u32) -> Result<(), PeerManagerError> {
         let (tx, rx) = oneshot::channel();
         if self
             .sender
@@ -336,9 +342,13 @@ impl PeerManagerHandle {
             .await
             .is_ok()
         {
-            rx.await.unwrap_or_else(|_| Err("Channel closed".to_string()))
+            rx.await.unwrap_or_else(|_| {
+                Err(PeerManagerError::InvalidConfig("channel closed".to_string()))
+            })
         } else {
-            Err("Failed to send command".to_string())
+            Err(PeerManagerError::InvalidConfig(
+                "failed to send command".to_string(),
+            ))
         }
     }
 
@@ -455,8 +465,7 @@ mod tests {
         };
 
         let result = handle.add_peer(config).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Interface is required");
+        assert!(matches!(result, Err(PeerManagerError::InvalidConfig(_))));
     }
 
     #[tokio::test]
@@ -479,8 +488,7 @@ mod tests {
             remote_asn: None,
         };
         let result2 = handle.add_peer(config2).await;
-        assert!(result2.is_err());
-        assert!(result2.unwrap_err().contains("already exists"));
+        assert!(matches!(result2, Err(PeerManagerError::PeerExists { .. })));
     }
 
     #[tokio::test]
@@ -503,8 +511,10 @@ mod tests {
             remote_asn: Some(65002),
         };
         let result2 = handle.add_peer(config2).await;
-        assert!(result2.is_err());
-        assert!(result2.unwrap_err().contains("already exists"));
+        assert!(matches!(
+            result2,
+            Err(PeerManagerError::PeerExistsWithAddress { .. })
+        ));
     }
 
     #[tokio::test]
@@ -567,8 +577,7 @@ mod tests {
         let (handle, _state) = create_test_fixtures().await;
 
         let result = handle.remove_peer(99999).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not found"));
+        assert!(matches!(result, Err(PeerManagerError::PeerNotFound(99999))));
     }
 
     #[tokio::test]

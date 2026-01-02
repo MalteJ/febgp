@@ -8,6 +8,7 @@
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::bgp::ParsedRoute;
+use crate::error::RibError;
 use crate::netlink::NetlinkHandle;
 
 /// Special peer index for locally originated routes (via API).
@@ -93,12 +94,12 @@ pub enum RibCommand {
     /// Add a locally originated route (via API).
     AddApiRoute {
         route: ApiRoute,
-        response: oneshot::Sender<Result<(), String>>,
+        response: oneshot::Sender<Result<(), RibError>>,
     },
     /// Withdraw a locally originated route (via API).
     WithdrawApiRoute {
         prefix: String,
-        response: oneshot::Sender<Result<(), String>>,
+        response: oneshot::Sender<Result<(), RibError>>,
     },
     /// Get all locally originated routes (for advertising to new peers).
     GetApiRoutes {
@@ -157,15 +158,15 @@ impl Rib {
     }
 
     /// Add a locally originated route.
-    pub fn add_api_route(&mut self, route: ApiRoute) -> Result<(), String> {
+    pub fn add_api_route(&mut self, route: ApiRoute) -> Result<(), RibError> {
         // Check if route already exists
         if self.api_routes.iter().any(|r| r.prefix == route.prefix) {
-            return Err(format!("Route for prefix {} already exists", route.prefix));
+            return Err(RibError::DuplicateRoute(route.prefix));
         }
 
         // Validate prefix format
         if !is_valid_prefix(&route.prefix) {
-            return Err(format!("Invalid prefix format: {}", route.prefix));
+            return Err(RibError::InvalidPrefix(route.prefix));
         }
 
         self.api_routes.push(route);
@@ -173,11 +174,11 @@ impl Rib {
     }
 
     /// Withdraw a locally originated route.
-    pub fn withdraw_api_route(&mut self, prefix: &str) -> Result<ApiRoute, String> {
+    pub fn withdraw_api_route(&mut self, prefix: &str) -> Result<ApiRoute, RibError> {
         let idx = self.api_routes.iter().position(|r| r.prefix == prefix);
         match idx {
             Some(i) => Ok(self.api_routes.remove(i)),
-            None => Err(format!("No API route for prefix {}", prefix)),
+            None => Err(RibError::RouteNotFound(prefix.to_string())),
         }
     }
 
@@ -686,7 +687,7 @@ impl RibHandle {
     }
 
     /// Add a locally originated route (via API).
-    pub async fn add_api_route(&self, route: ApiRoute) -> Result<(), String> {
+    pub async fn add_api_route(&self, route: ApiRoute) -> Result<(), RibError> {
         let (tx, rx) = oneshot::channel();
         if self
             .sender
@@ -694,14 +695,15 @@ impl RibHandle {
             .await
             .is_ok()
         {
-            rx.await.unwrap_or_else(|_| Err("Channel closed".to_string()))
+            rx.await
+                .unwrap_or_else(|_| Err(RibError::ChannelError("channel closed".to_string())))
         } else {
-            Err("Failed to send command".to_string())
+            Err(RibError::ChannelError("failed to send command".to_string()))
         }
     }
 
     /// Withdraw a locally originated route (via API).
-    pub async fn withdraw_api_route(&self, prefix: String) -> Result<(), String> {
+    pub async fn withdraw_api_route(&self, prefix: String) -> Result<(), RibError> {
         let (tx, rx) = oneshot::channel();
         if self
             .sender
@@ -709,9 +711,10 @@ impl RibHandle {
             .await
             .is_ok()
         {
-            rx.await.unwrap_or_else(|_| Err("Channel closed".to_string()))
+            rx.await
+                .unwrap_or_else(|_| Err(RibError::ChannelError("channel closed".to_string())))
         } else {
-            Err("Failed to send command".to_string())
+            Err(RibError::ChannelError("failed to send command".to_string()))
         }
     }
 
@@ -1024,8 +1027,7 @@ mod tests {
 
         assert!(rib.add_api_route(route1).is_ok());
         let result = rib.add_api_route(route2);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("already exists"));
+        assert!(matches!(result, Err(RibError::DuplicateRoute(_))));
     }
 
     #[test]
@@ -1039,8 +1041,7 @@ mod tests {
         };
 
         let result = rib.add_api_route(route);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid prefix"));
+        assert!(matches!(result, Err(RibError::InvalidPrefix(_))));
     }
 
     #[test]
@@ -1066,8 +1067,7 @@ mod tests {
         let mut rib = Rib::new();
 
         let result = rib.withdraw_api_route("10.0.0.0/24");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No API route"));
+        assert!(matches!(result, Err(RibError::RouteNotFound(_))));
     }
 
     #[tokio::test]

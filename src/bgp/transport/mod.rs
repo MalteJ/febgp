@@ -8,49 +8,40 @@ pub mod tcp;
 
 use std::io;
 
+use thiserror::Error;
+
 use crate::bgp::message::Message;
 
 /// Error type for transport operations.
 ///
 /// The `MessageTooLarge` variant is defined for RFC compliance but not yet used;
 /// currently oversized messages are rejected with `InvalidMessage`.
-#[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum TransportError {
     /// TCP connection failed.
-    ConnectionFailed(io::Error),
+    #[error("connection failed: {0}")]
+    ConnectionFailed(#[source] io::Error),
+
     /// Connection was closed by the peer.
+    #[error("connection closed")]
     ConnectionClosed,
+
     /// Message was too large (>4096 bytes per RFC 4271).
+    #[allow(dead_code)]
+    #[error("message too large")]
     MessageTooLarge,
+
     /// Invalid or malformed message.
+    #[error("invalid message: {0}")]
     InvalidMessage(String),
+
     /// Operation timed out.
+    #[error("operation timed out")]
     Timeout,
+
     /// Other I/O error.
-    Io(io::Error),
-}
-
-impl std::fmt::Display for TransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransportError::ConnectionFailed(e) => write!(f, "connection failed: {}", e),
-            TransportError::ConnectionClosed => write!(f, "connection closed"),
-            TransportError::MessageTooLarge => write!(f, "message too large"),
-            TransportError::InvalidMessage(msg) => write!(f, "invalid message: {}", msg),
-            TransportError::Timeout => write!(f, "operation timed out"),
-            TransportError::Io(e) => write!(f, "I/O error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for TransportError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            TransportError::ConnectionFailed(e) | TransportError::Io(e) => Some(e),
-            _ => None,
-        }
-    }
+    #[error("I/O error: {0}")]
+    Io(#[source] io::Error),
 }
 
 impl From<io::Error> for TransportError {

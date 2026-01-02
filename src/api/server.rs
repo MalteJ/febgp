@@ -221,7 +221,7 @@ impl FebgpService for FebgpServiceImpl {
             })),
             Err(e) => Ok(Response::new(AddRouteResponse {
                 success: false,
-                error: e,
+                error: e.to_string(),
             })),
         }
     }
@@ -252,7 +252,7 @@ impl FebgpService for FebgpServiceImpl {
             })),
             Err(e) => Ok(Response::new(WithdrawRouteResponse {
                 success: false,
-                error: e,
+                error: e.to_string(),
             })),
         }
     }
@@ -301,7 +301,7 @@ impl FebgpService for FebgpServiceImpl {
             })),
             Err(e) => Ok(Response::new(AddPeerResponse {
                 success: false,
-                error: e,
+                error: e.to_string(),
                 peer_id: 0,
             })),
         }
@@ -333,7 +333,7 @@ impl FebgpService for FebgpServiceImpl {
             })),
             Err(e) => Ok(Response::new(RemovePeerResponse {
                 success: false,
-                error: e,
+                error: e.to_string(),
             })),
         }
     }
