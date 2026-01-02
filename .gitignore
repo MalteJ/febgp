@@ -1,2 +1,46 @@
-/target
-/tools
+# Build artifacts
+/target/
+/tools/
+
+# Cargo
+Cargo.lock
+**/*.rs.bk
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug and profiling
+*.pdb
+perf.data
+perf.data.old
+flamegraph.svg
+cachegrind.out.*
+callgrind.out.*
+
+# Testing and coverage
+*.profraw
+*.profdata
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# AI assistants
+CLAUDE.md
+AGENTS.md
