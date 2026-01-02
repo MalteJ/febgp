@@ -16,4 +16,6 @@ pub use session_actor::{SessionActor, SessionCommand, SessionEvent};
 pub use transport::tcp::TcpTransport;
 
 // UPDATE parsing and building
-pub use update::{build_ipv4_update, build_ipv6_update, parse_update, ParsedRoute};
+pub use update::{
+    build_ipv4_update, build_ipv6_update, parse_update, validate_and_parse_update, ParsedRoute,
+};

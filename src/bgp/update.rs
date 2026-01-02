@@ -4,6 +4,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use crate::bgp::fsm::NotificationError;
+
+// BGP path attribute type codes (RFC 4271)
+const ATTR_ORIGIN: u8 = 1;
+const ATTR_AS_PATH: u8 = 2;
+const ATTR_NEXT_HOP: u8 = 3;
+const ATTR_MP_REACH_NLRI: u8 = 14;
+
 /// A parsed BGP route from an UPDATE message
 #[derive(Debug, Clone)]
 pub struct ParsedRoute {
@@ -186,6 +194,312 @@ pub fn parse_update(data: &Bytes) -> Vec<ParsedRoute> {
     }
 
     routes
+}
+
+/// Validate and parse a BGP UPDATE message body.
+///
+/// Returns `Ok(routes)` if the UPDATE is valid, or `Err(NotificationError)` if
+/// validation fails. Per RFC 4271 Section 6.3, validation includes:
+/// - Well-formed attribute list (correct lengths)
+/// - Presence of mandatory well-known attributes (ORIGIN, AS_PATH for routes)
+/// - Valid ORIGIN attribute value (0, 1, or 2)
+/// - Well-formed AS_PATH attribute
+/// - Valid NLRI prefix lengths
+///
+/// Note: Empty UPDATEs (no routes, only withdrawals or keepalive-equivalent) are valid.
+pub fn validate_and_parse_update(data: &Bytes) -> Result<Vec<ParsedRoute>, NotificationError> {
+    let mut routes = Vec::new();
+    let mut buf = data.clone();
+
+    // Minimum UPDATE message body is 4 bytes (withdrawn_len + path_attr_len)
+    if buf.remaining() < 4 {
+        return Err(NotificationError::malformed_attribute_list());
+    }
+
+    // Withdrawn Routes Length
+    let withdrawn_len = buf.get_u16() as usize;
+    if buf.remaining() < withdrawn_len {
+        return Err(NotificationError::malformed_attribute_list());
+    }
+    // Skip withdrawn routes for now (TODO: process withdrawals)
+    buf.advance(withdrawn_len);
+
+    if buf.remaining() < 2 {
+        return Err(NotificationError::malformed_attribute_list());
+    }
+
+    // Total Path Attribute Length
+    let path_attr_len = buf.get_u16() as usize;
+
+    if buf.remaining() < path_attr_len {
+        return Err(NotificationError::malformed_attribute_list());
+    }
+
+    // Split the buffer: path attributes and then NLRI
+    let mut path_attrs = buf.copy_to_bytes(path_attr_len);
+    let mut nlri_data = buf; // Remaining is NLRI
+
+    // Track which mandatory attributes we've seen
+    let mut has_origin = false;
+    let mut has_as_path = false;
+    let mut has_next_hop = false;
+    let mut has_mp_reach = false;
+
+    // Parse and validate path attributes
+    let mut origin = Origin::Incomplete;
+    let mut as_path: Vec<u32> = Vec::new();
+    let mut next_hop_v4: Option<Ipv4Addr> = None;
+    let mut mp_reach_v4: Vec<(String, IpAddr)> = Vec::new();
+    let mut mp_reach_v6: Vec<(String, IpAddr)> = Vec::new();
+
+    while path_attrs.remaining() >= 2 {
+        let flags = path_attrs.get_u8();
+        let attr_type = path_attrs.get_u8();
+
+        let extended = (flags & 0x10) != 0;
+        let attr_len = if extended {
+            if path_attrs.remaining() < 2 {
+                return Err(NotificationError::malformed_attribute_list());
+            }
+            path_attrs.get_u16() as usize
+        } else {
+            if path_attrs.remaining() < 1 {
+                return Err(NotificationError::malformed_attribute_list());
+            }
+            path_attrs.get_u8() as usize
+        };
+
+        if path_attrs.remaining() < attr_len {
+            return Err(NotificationError::attribute_length_error(&[attr_type]));
+        }
+
+        let attr_data = path_attrs.copy_to_bytes(attr_len);
+
+        match attr_type {
+            ATTR_ORIGIN => {
+                has_origin = true;
+                if attr_data.is_empty() {
+                    return Err(NotificationError::attribute_length_error(&[ATTR_ORIGIN]));
+                }
+                origin = match attr_data[0] {
+                    0 => Origin::Igp,
+                    1 => Origin::Egp,
+                    2 => Origin::Incomplete,
+                    _ => return Err(NotificationError::invalid_origin()),
+                };
+            }
+            ATTR_AS_PATH => {
+                has_as_path = true;
+                as_path = validate_and_parse_as_path(&attr_data)?;
+            }
+            ATTR_NEXT_HOP => {
+                has_next_hop = true;
+                if attr_data.len() != 4 {
+                    return Err(NotificationError::attribute_length_error(&[ATTR_NEXT_HOP]));
+                }
+                let nh = Ipv4Addr::new(attr_data[0], attr_data[1], attr_data[2], attr_data[3]);
+                // RFC 4271: next-hop must not be 0.0.0.0
+                if nh.is_unspecified() {
+                    return Err(NotificationError::invalid_next_hop(&attr_data));
+                }
+                next_hop_v4 = Some(nh);
+            }
+            ATTR_MP_REACH_NLRI => {
+                has_mp_reach = true;
+                if attr_data.len() < 5 {
+                    return Err(NotificationError::attribute_length_error(&[ATTR_MP_REACH_NLRI]));
+                }
+                let mut mp_buf = attr_data;
+                let afi = mp_buf.get_u16();
+                let safi = mp_buf.get_u8();
+                let nh_len = mp_buf.get_u8() as usize;
+
+                if mp_buf.remaining() < nh_len + 1 {
+                    return Err(NotificationError::attribute_length_error(&[ATTR_MP_REACH_NLRI]));
+                }
+
+                if safi == 1 {
+                    // Unicast
+                    let nh_data = mp_buf.copy_to_bytes(nh_len);
+                    mp_buf.advance(1); // Reserved byte
+                    let nlri = mp_buf;
+
+                    let next_hop = parse_next_hop(&nh_data);
+
+                    if afi == 1 {
+                        // IPv4 unicast
+                        for prefix in validate_ipv4_nlri(&nlri)? {
+                            mp_reach_v4.push((prefix, next_hop));
+                        }
+                    } else if afi == 2 {
+                        // IPv6 unicast
+                        for prefix in validate_ipv6_nlri(&nlri)? {
+                            mp_reach_v6.push((prefix, next_hop));
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Unknown attributes are ignored (optional non-transitive)
+                // or passed through (optional transitive)
+            }
+        }
+    }
+
+    // Check for mandatory attributes only if we have NLRI
+    let has_nlri = nlri_data.has_remaining() || !mp_reach_v4.is_empty() || !mp_reach_v6.is_empty();
+
+    if has_nlri {
+        // ORIGIN and AS_PATH are mandatory for any UPDATE with NLRI
+        if !has_origin {
+            return Err(NotificationError::missing_well_known_attribute(ATTR_ORIGIN));
+        }
+        if !has_as_path {
+            return Err(NotificationError::missing_well_known_attribute(ATTR_AS_PATH));
+        }
+        // NEXT_HOP is mandatory for traditional IPv4 NLRI (not MP_REACH)
+        if nlri_data.has_remaining() && !has_next_hop && !has_mp_reach {
+            return Err(NotificationError::missing_well_known_attribute(ATTR_NEXT_HOP));
+        }
+    }
+
+    // Parse IPv4 NLRI (traditional, after path attributes)
+    if nlri_data.has_remaining() {
+        let next_hop: IpAddr = next_hop_v4
+            .map(IpAddr::from)
+            .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+        for prefix in validate_ipv4_nlri(&nlri_data.copy_to_bytes(nlri_data.remaining()))? {
+            routes.push(ParsedRoute {
+                prefix,
+                next_hop,
+                as_path: as_path.clone(),
+                origin,
+            });
+        }
+    }
+
+    // Add MP_REACH routes
+    for (prefix, next_hop) in mp_reach_v4 {
+        routes.push(ParsedRoute {
+            prefix,
+            next_hop,
+            as_path: as_path.clone(),
+            origin,
+        });
+    }
+    for (prefix, next_hop) in mp_reach_v6 {
+        routes.push(ParsedRoute {
+            prefix,
+            next_hop,
+            as_path: as_path.clone(),
+            origin,
+        });
+    }
+
+    Ok(routes)
+}
+
+/// Validate and parse AS_PATH attribute.
+fn validate_and_parse_as_path(data: &Bytes) -> Result<Vec<u32>, NotificationError> {
+    let mut asns = Vec::new();
+    let mut buf = data.clone();
+
+    while buf.remaining() >= 2 {
+        let seg_type = buf.get_u8();
+        let seg_len = buf.get_u8() as usize;
+
+        // Valid segment types: AS_SET (1), AS_SEQUENCE (2)
+        // RFC 5065 adds AS_CONFED_SEQUENCE (3) and AS_CONFED_SET (4)
+        if seg_type == 0 || seg_type > 4 {
+            return Err(NotificationError::malformed_as_path());
+        }
+
+        // Check we have enough bytes for all ASNs (4 bytes each)
+        let bytes_needed = seg_len * 4;
+        if buf.remaining() < bytes_needed {
+            return Err(NotificationError::malformed_as_path());
+        }
+
+        // AS_SEQUENCE (2) or AS_SET (1)
+        if seg_type == 1 || seg_type == 2 {
+            for _ in 0..seg_len {
+                asns.push(buf.get_u32());
+            }
+        } else {
+            // Skip confederation segments
+            buf.advance(bytes_needed);
+        }
+    }
+
+    // If there are leftover bytes, the AS_PATH is malformed
+    if buf.has_remaining() {
+        return Err(NotificationError::malformed_as_path());
+    }
+
+    Ok(asns)
+}
+
+/// Validate and parse IPv4 NLRI, returning an error for invalid prefix lengths.
+fn validate_ipv4_nlri(data: &Bytes) -> Result<Vec<String>, NotificationError> {
+    let mut prefixes = Vec::new();
+    let mut buf = data.clone();
+
+    while buf.has_remaining() {
+        let prefix_len = buf.get_u8();
+
+        // IPv4 prefix length must be 0-32
+        if prefix_len > 32 {
+            return Err(NotificationError::invalid_network_field());
+        }
+
+        let bytes_needed = (prefix_len as usize).div_ceil(8);
+
+        if buf.remaining() < bytes_needed {
+            return Err(NotificationError::invalid_network_field());
+        }
+
+        let mut octets = [0u8; 4];
+        for octet in octets.iter_mut().take(bytes_needed) {
+            *octet = buf.get_u8();
+        }
+
+        let addr = Ipv4Addr::from(octets);
+        prefixes.push(format!("{}/{}", addr, prefix_len));
+    }
+
+    Ok(prefixes)
+}
+
+/// Validate and parse IPv6 NLRI, returning an error for invalid prefix lengths.
+fn validate_ipv6_nlri(data: &Bytes) -> Result<Vec<String>, NotificationError> {
+    let mut prefixes = Vec::new();
+    let mut buf = data.clone();
+
+    while buf.has_remaining() {
+        let prefix_len = buf.get_u8();
+
+        // IPv6 prefix length must be 0-128
+        if prefix_len > 128 {
+            return Err(NotificationError::invalid_network_field());
+        }
+
+        let bytes_needed = (prefix_len as usize).div_ceil(8);
+
+        if buf.remaining() < bytes_needed {
+            return Err(NotificationError::invalid_network_field());
+        }
+
+        let mut octets = [0u8; 16];
+        for octet in octets.iter_mut().take(bytes_needed) {
+            *octet = buf.get_u8();
+        }
+
+        let addr = Ipv6Addr::from(octets);
+        prefixes.push(format!("{}/{}", addr, prefix_len));
+    }
+
+    Ok(prefixes)
 }
 
 /// Parse next-hop from MP_REACH_NLRI based on length
@@ -451,5 +765,102 @@ mod tests {
         let data = Bytes::from_static(&[2, 1, 0, 0, 0xFD, 0xEA]); // type=2, len=1, ASN=65002
         let asns = parse_as_path(&data);
         assert_eq!(asns, vec![65002]);
+    }
+
+    // Validation tests
+
+    #[test]
+    fn test_validate_as_path_valid() {
+        // AS_SEQUENCE with 2 ASNs
+        let data = Bytes::from_static(&[2, 2, 0, 0, 0xFD, 0xEA, 0, 0, 0xFD, 0xEB]);
+        let result = validate_and_parse_as_path(&data);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![65002, 65003]);
+    }
+
+    #[test]
+    fn test_validate_as_path_invalid_segment_type() {
+        // Invalid segment type (0)
+        let data = Bytes::from_static(&[0, 1, 0, 0, 0xFD, 0xEA]);
+        let result = validate_and_parse_as_path(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_as_path_truncated() {
+        // Segment claims 2 ASNs but only has bytes for 1
+        let data = Bytes::from_static(&[2, 2, 0, 0, 0xFD, 0xEA]);
+        let result = validate_and_parse_as_path(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ipv4_nlri_valid() {
+        let data = Bytes::from_static(&[24, 10, 100, 0]);
+        let result = validate_ipv4_nlri(&data);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["10.100.0.0/24"]);
+    }
+
+    #[test]
+    fn test_validate_ipv4_nlri_invalid_prefix_length() {
+        // Prefix length 33 is invalid for IPv4
+        let data = Bytes::from_static(&[33, 10, 100, 0, 0, 0]);
+        let result = validate_ipv4_nlri(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ipv6_nlri_valid() {
+        let data = Bytes::from_static(&[48, 0x20, 0x01, 0x0d, 0xb8, 0x01, 0x00]);
+        let result = validate_ipv6_nlri(&data);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["2001:db8:100::/48"]);
+    }
+
+    #[test]
+    fn test_validate_ipv6_nlri_invalid_prefix_length() {
+        // Prefix length 129 is invalid for IPv6
+        let data = Bytes::from_static(&[129, 0x20, 0x01]);
+        let result = validate_ipv6_nlri(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_update_empty_valid() {
+        // Empty UPDATE (no withdrawn, no attrs, no nlri) - valid as keepalive-like
+        let data = Bytes::from_static(&[0, 0, 0, 0]);
+        let result = validate_and_parse_update(&data);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_validate_update_too_short() {
+        // Too short to be valid
+        let data = Bytes::from_static(&[0, 0]);
+        let result = validate_and_parse_update(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_update_invalid_origin() {
+        // Build UPDATE with invalid ORIGIN value (5)
+        let mut update = BytesMut::new();
+        update.put_u16(0); // withdrawn len
+        // Path attrs: ORIGIN with invalid value
+        let mut attrs = BytesMut::new();
+        attrs.put_u8(0x40); // flags
+        attrs.put_u8(1);    // ORIGIN
+        attrs.put_u8(1);    // len
+        attrs.put_u8(5);    // invalid value
+        update.put_u16(attrs.len() as u16);
+        update.put(attrs);
+        // Add NLRI to trigger mandatory attr check
+        update.put_u8(24);
+        update.put_slice(&[10, 0, 0]);
+
+        let result = validate_and_parse_update(&update.freeze());
+        assert!(result.is_err());
     }
 }

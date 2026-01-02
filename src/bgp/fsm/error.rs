@@ -189,6 +189,65 @@ impl NotificationError {
             OpenErrorSubcode::UnacceptableHoldTime as u8,
         )
     }
+
+    /// Create an UPDATE error for malformed attribute list.
+    pub fn malformed_attribute_list() -> Self {
+        Self::new(
+            ErrorCode::UpdateMessageError,
+            UpdateErrorSubcode::MalformedAttributeList as u8,
+        )
+    }
+
+    /// Create an UPDATE error for missing well-known attribute.
+    pub fn missing_well_known_attribute(attr_type: u8) -> Self {
+        Self::with_data(
+            ErrorCode::UpdateMessageError,
+            UpdateErrorSubcode::MissingWellKnownAttribute as u8,
+            vec![attr_type],
+        )
+    }
+
+    /// Create an UPDATE error for invalid ORIGIN attribute.
+    pub fn invalid_origin() -> Self {
+        Self::new(
+            ErrorCode::UpdateMessageError,
+            UpdateErrorSubcode::InvalidOriginAttribute as u8,
+        )
+    }
+
+    /// Create an UPDATE error for malformed AS_PATH.
+    pub fn malformed_as_path() -> Self {
+        Self::new(
+            ErrorCode::UpdateMessageError,
+            UpdateErrorSubcode::MalformedAsPath as u8,
+        )
+    }
+
+    /// Create an UPDATE error for invalid NEXT_HOP attribute.
+    pub fn invalid_next_hop(next_hop: &[u8]) -> Self {
+        Self::with_data(
+            ErrorCode::UpdateMessageError,
+            UpdateErrorSubcode::InvalidNextHopAttribute as u8,
+            next_hop.to_vec(),
+        )
+    }
+
+    /// Create an UPDATE error for invalid network field (NLRI).
+    pub fn invalid_network_field() -> Self {
+        Self::new(
+            ErrorCode::UpdateMessageError,
+            UpdateErrorSubcode::InvalidNetworkField as u8,
+        )
+    }
+
+    /// Create an UPDATE error for attribute length error.
+    pub fn attribute_length_error(attr_data: &[u8]) -> Self {
+        Self::with_data(
+            ErrorCode::UpdateMessageError,
+            UpdateErrorSubcode::AttributeLengthError as u8,
+            attr_data.to_vec(),
+        )
+    }
 }
 
 #[cfg(test)]
