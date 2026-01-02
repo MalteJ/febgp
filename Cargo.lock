@@ -252,6 +252,7 @@ dependencies = [
  "rtnetlink",
  "serde",
  "socket2 0.5.10",
+ "thiserror 2.0.17",
  "tokio",
  "tokio-stream",
  "toml",
