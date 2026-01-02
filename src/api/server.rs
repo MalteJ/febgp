@@ -291,6 +291,7 @@ impl FebgpService for FebgpServiceImpl {
             interface: req.interface,
             address: if req.address.is_empty() { None } else { Some(req.address) },
             remote_asn: if req.remote_asn == 0 { None } else { Some(req.remote_asn) },
+            session_mode: Default::default(), // Use default (Both)
         };
 
         match pm.add_peer(config).await {

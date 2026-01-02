@@ -67,6 +67,19 @@ impl Default for Config {
     }
 }
 
+/// BGP session mode - controls whether we initiate connections, accept them, or both.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionMode {
+    /// Initiate outbound connections only (active mode).
+    Active,
+    /// Accept incoming connections only (passive mode).
+    Passive,
+    /// Both initiate and accept connections (RFC 4271 default).
+    #[default]
+    Both,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PeerConfig {
     /// Interface name for link-local peering (required)
@@ -75,6 +88,9 @@ pub struct PeerConfig {
     pub remote_asn: Option<u32>,
     /// Explicit peer address - if not specified, uses neighbor discovery
     pub address: Option<String>,
+    /// Session mode: active, passive, or both (default: both)
+    #[serde(default)]
+    pub session_mode: SessionMode,
 }
 
 impl Config {

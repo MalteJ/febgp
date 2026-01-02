@@ -439,6 +439,7 @@ mod tests {
             interface: "eth0".to_string(),
             address: Some("192.168.1.1".to_string()),
             remote_asn: Some(65001),
+            session_mode: Default::default(),
         };
 
         let result = handle.add_peer(config).await;
@@ -462,6 +463,7 @@ mod tests {
             interface: "".to_string(),
             address: Some("192.168.1.1".to_string()),
             remote_asn: Some(65001),
+            session_mode: Default::default(),
         };
 
         let result = handle.add_peer(config).await;
@@ -477,6 +479,7 @@ mod tests {
             interface: "eth0".to_string(),
             address: None,
             remote_asn: None,
+            session_mode: Default::default(),
         };
         let result1 = handle.add_peer(config1).await;
         assert!(result1.is_ok());
@@ -486,6 +489,7 @@ mod tests {
             interface: "eth0".to_string(),
             address: None,
             remote_asn: None,
+            session_mode: Default::default(),
         };
         let result2 = handle.add_peer(config2).await;
         assert!(matches!(result2, Err(PeerManagerError::PeerExists { .. })));
@@ -500,6 +504,7 @@ mod tests {
             interface: "eth0".to_string(),
             address: Some("192.168.1.1".to_string()),
             remote_asn: Some(65001),
+            session_mode: Default::default(),
         };
         let result1 = handle.add_peer(config1).await;
         assert!(result1.is_ok());
@@ -509,6 +514,7 @@ mod tests {
             interface: "eth0".to_string(),
             address: Some("192.168.1.1".to_string()),
             remote_asn: Some(65002),
+            session_mode: Default::default(),
         };
         let result2 = handle.add_peer(config2).await;
         assert!(matches!(
@@ -526,6 +532,7 @@ mod tests {
             interface: "eth0".to_string(),
             address: Some("192.168.1.1".to_string()),
             remote_asn: Some(65001),
+            session_mode: Default::default(),
         };
         let result1 = handle.add_peer(config1).await;
         assert!(result1.is_ok());
@@ -535,6 +542,7 @@ mod tests {
             interface: "eth0".to_string(),
             address: Some("192.168.1.2".to_string()),
             remote_asn: Some(65002),
+            session_mode: Default::default(),
         };
         let result2 = handle.add_peer(config2).await;
         assert!(result2.is_ok());
@@ -553,6 +561,7 @@ mod tests {
             interface: "eth0".to_string(),
             address: Some("192.168.1.1".to_string()),
             remote_asn: Some(65001),
+            session_mode: Default::default(),
         };
         let peer_id = handle.add_peer(config).await.unwrap();
 
@@ -589,11 +598,13 @@ mod tests {
             interface: "eth0".to_string(),
             address: Some("192.168.1.1".to_string()),
             remote_asn: Some(65001),
+            session_mode: Default::default(),
         };
         let config2 = PeerConfig {
             interface: "eth1".to_string(),
             address: Some("192.168.2.1".to_string()),
             remote_asn: Some(65002),
+            session_mode: Default::default(),
         };
 
         let _ = handle.add_peer(config1.clone()).await.unwrap();
@@ -619,6 +630,7 @@ mod tests {
             interface: "eth0".to_string(),
             address: Some("192.168.1.1".to_string()),
             remote_asn: Some(65001),
+            session_mode: Default::default(),
         };
 
         // Register a startup peer

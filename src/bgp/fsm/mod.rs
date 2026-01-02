@@ -187,6 +187,15 @@ impl Fsm {
                     FsmAction::InitiateTcpConnection,
                 ]
             }
+            // Accept incoming connections in Idle state (passive mode support)
+            FsmEvent::Tcp(TcpEvent::TcpConnectionConfirmed) => {
+                self.state = FsmState::OpenSent;
+                vec![
+                    FsmAction::ResetConnectRetryCounter,
+                    FsmAction::SendOpen,
+                    FsmAction::StartHoldTimer(Duration::from_secs(240)),
+                ]
+            }
             // All other events are ignored in Idle state
             _ => vec![],
         }

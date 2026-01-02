@@ -17,7 +17,7 @@ use crate::bgp::{
     build_ipv4_update, build_ipv6_update, parse_update, FsmConfig, FsmState, SessionActor,
     SessionCommand, SessionEvent, TcpTransport,
 };
-use crate::config::{Config, parse_peer_address, PeerConfig};
+use crate::config::{Config, parse_peer_address, PeerConfig, SessionMode};
 use crate::neighbor_discovery::get_interface_link_local;
 use crate::peer_manager::PeerManagerHandle;
 use crate::rib::{RibHandle, RouteEvent, LOCAL_PEER_IDX};
@@ -102,17 +102,25 @@ pub async fn run_peer_session(
         shutdown_rx,
     } = ctx;
 
+    let session_mode = peer.session_mode;
+
     // Get peer address - either passed in or parsed from config
+    // For passive-only mode, address is optional (we accept incoming connections)
     let peer_addr = match peer_addr {
-        Some(addr) => addr,
+        Some(addr) => Some(addr),
         None => match parse_peer_address(&peer) {
-            Ok(Some(addr)) => addr,
+            Ok(Some(addr)) => Some(addr),
             Ok(None) => {
-                error!(
-                    interface = peer.interface,
-                    "No peer address available for {}", peer.interface
-                );
-                return;
+                if session_mode == SessionMode::Passive {
+                    // Passive mode doesn't require an address - we'll accept incoming
+                    None
+                } else {
+                    error!(
+                        interface = peer.interface,
+                        "No peer address available for {}", peer.interface
+                    );
+                    return;
+                }
             }
             Err(e) => {
                 error!(
@@ -125,11 +133,37 @@ pub async fn run_peer_session(
         },
     };
 
-    info!(
-        peer = %peer_addr,
-        interface = peer.interface,
-        "Starting BGP session to {} via {}", peer_addr, peer.interface
-    );
+    // Create display string for logging (used throughout the function)
+    let peer_addr_display = peer_addr
+        .as_ref()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| format!("passive:{}", peer.interface));
+
+    match (session_mode, &peer_addr) {
+        (SessionMode::Active | SessionMode::Both, Some(addr)) => {
+            info!(
+                peer = %addr,
+                interface = peer.interface,
+                mode = ?session_mode,
+                "Starting BGP session to {} via {}", addr, peer.interface
+            );
+        }
+        (SessionMode::Passive, _) => {
+            info!(
+                interface = peer.interface,
+                mode = ?session_mode,
+                "Waiting for incoming BGP connections on {}", peer.interface
+            );
+        }
+        (_, None) => {
+            // This shouldn't happen due to earlier check, but handle gracefully
+            error!(
+                interface = peer.interface,
+                "No peer address for active session on {}", peer.interface
+            );
+            return;
+        }
+    }
 
     // Create FSM configuration
     let fsm_config = FsmConfig {
@@ -142,8 +176,13 @@ pub async fn run_peer_session(
         ipv6_unicast,
     };
 
-    // Create transport
-    let transport = TcpTransport::new(peer_addr);
+    // Create transport - use a placeholder address for passive-only mode
+    let transport_addr = peer_addr.unwrap_or_else(|| {
+        // Placeholder for passive mode - won't be used for outbound
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        std::net::SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 179, 0, 0))
+    });
+    let transport = TcpTransport::new(transport_addr);
 
     // Create event channel
     let (event_tx, mut event_rx) = mpsc::channel::<SessionEvent>(16);
@@ -152,14 +191,16 @@ pub async fn run_peer_session(
     let actor = SessionActor::new(fsm_config, transport, cmd_rx, event_tx);
     tokio::spawn(actor.run());
 
-    // Send start command
-    if let Err(e) = cmd_tx.send(SessionCommand::Start).await {
-        error!(
-            interface = peer.interface,
-            error = %e,
-            "Failed to start session for {}: {}", peer.interface, e
-        );
-        return;
+    // Send start command only for active/both modes
+    if session_mode != SessionMode::Passive {
+        if let Err(e) = cmd_tx.send(SessionCommand::Start).await {
+            error!(
+                interface = peer.interface,
+                error = %e,
+                "Failed to start session for {}: {}", peer.interface, e
+            );
+            return;
+        }
     }
 
     let mut established_at: Option<Instant> = None;
@@ -192,7 +233,7 @@ pub async fn run_peer_session(
                         if to == FsmState::Established {
                             established_at = Some(Instant::now());
                             is_established = true;
-                            info!(peer = %peer_addr, "Session established with {}", peer_addr);
+                            info!(peer = %peer_addr_display, "Session established with {}", peer_addr_display);
                         } else if to == FsmState::Idle {
                             established_at = None;
                             is_established = false;
@@ -202,11 +243,11 @@ pub async fn run_peer_session(
                         // Update with learned ASN
                         update_peer_asn(&state, peer_idx, peer_asn).await;
                         info!(
-                            peer = %peer_addr,
+                            peer = %peer_addr_display,
                             asn = peer_asn,
                             router_id = %peer_router_id,
                             "Peer {} (AS{}) router-id: {}",
-                            peer_addr, peer_asn, peer_router_id
+                            peer_addr_display, peer_asn, peer_router_id
                         );
 
                         // Get our link-local address for the interface to use as next-hop
@@ -229,15 +270,15 @@ pub async fn run_peer_session(
                                 if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
                                     error!(
                                         prefix = prefix,
-                                        peer = %peer_addr,
+                                        peer = %peer_addr_display,
                                         error = %e,
                                         "Failed to send UPDATE for {}: {}", prefix, e
                                     );
                                 } else {
                                     debug!(
                                         prefix = prefix,
-                                        peer = %peer_addr,
-                                        "Announced prefix {} to {}", prefix, peer_addr
+                                        peer = %peer_addr_display,
+                                        "Announced prefix {} to {}", prefix, peer_addr_display
                                     );
                                 }
                             } else {
@@ -252,15 +293,15 @@ pub async fn run_peer_session(
                                 if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
                                     error!(
                                         prefix = %route.prefix,
-                                        peer = %peer_addr,
+                                        peer = %peer_addr_display,
                                         error = %e,
                                         "Failed to send API route UPDATE: {}", e
                                     );
                                 } else {
                                     debug!(
                                         prefix = %route.prefix,
-                                        peer = %peer_addr,
-                                        "Announced API route {} to {}", route.prefix, peer_addr
+                                        peer = %peer_addr_display,
+                                        "Announced API route {} to {}", route.prefix, peer_addr_display
                                     );
                                 }
                             }
@@ -268,9 +309,9 @@ pub async fn run_peer_session(
                     }
                     SessionEvent::SessionDown { reason } => {
                         warn!(
-                            peer = %peer_addr,
+                            peer = %peer_addr_display,
                             reason = reason,
-                            "Session to {} went down: {}", peer_addr, reason
+                            "Session to {} went down: {}", peer_addr_display, reason
                         );
                         update_peer_state(&state, peer_idx, crate::bgp::SessionState::Idle).await;
                         is_established = false;
@@ -296,28 +337,32 @@ pub async fn run_peer_session(
                         established_at = None;
 
                         // Automatic reconnection after a short delay (unless shutting down)
-                        let cmd_tx_clone = cmd_tx.clone();
-                        let shutdown_rx_clone = shutdown_rx.clone();
-                        tokio::spawn(async move {
-                            // Wait before attempting reconnection (avoids tight reconnect loop)
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        // Only reconnect if we have an address (active/both mode)
+                        if session_mode != SessionMode::Passive {
+                            let cmd_tx_clone = cmd_tx.clone();
+                            let shutdown_rx_clone = shutdown_rx.clone();
+                            let peer_addr_for_log = peer_addr_display.clone();
+                            tokio::spawn(async move {
+                                // Wait before attempting reconnection (avoids tight reconnect loop)
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-                            // Skip reconnection if shutdown is in progress
-                            if *shutdown_rx_clone.borrow() {
-                                debug!(peer = %peer_addr, "Skipping reconnect due to shutdown");
-                                return;
-                            }
+                                // Skip reconnection if shutdown is in progress
+                                if *shutdown_rx_clone.borrow() {
+                                    debug!(peer = %peer_addr_for_log, "Skipping reconnect due to shutdown");
+                                    return;
+                                }
 
-                            debug!(peer = %peer_addr, "Attempting to reconnect to peer...");
-                            match cmd_tx_clone.send(SessionCommand::Start).await {
-                                Ok(()) => debug!(peer = %peer_addr, "Reconnect command sent to {}", peer_addr),
-                                Err(e) => error!(
-                                    peer = %peer_addr,
-                                    error = %e,
-                                    "Failed to send reconnect command: {}", e
-                                ),
-                            }
-                        });
+                                debug!(peer = %peer_addr_for_log, "Attempting to reconnect to peer...");
+                                match cmd_tx_clone.send(SessionCommand::Start).await {
+                                    Ok(()) => debug!(peer = %peer_addr_for_log, "Reconnect command sent"),
+                                    Err(e) => error!(
+                                        peer = %peer_addr_for_log,
+                                        error = %e,
+                                        "Failed to send reconnect command: {}", e
+                                    ),
+                                }
+                            });
+                        }
                     }
                     SessionEvent::UpdateReceived(data) => {
                         // Parse UPDATE and add routes to RIB
@@ -396,14 +441,14 @@ pub async fn run_peer_session(
                             if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
                                 error!(
                                     prefix = %entry.prefix,
-                                    peer = %peer_addr,
+                                    peer = %peer_addr_display,
                                     error = %e,
                                     "Failed to advertise API route"
                                 );
                             } else {
                                 debug!(
                                     prefix = %entry.prefix,
-                                    peer = %peer_addr,
+                                    peer = %peer_addr_display,
                                     "Advertised API route to peer"
                                 );
                             }
@@ -413,7 +458,7 @@ pub async fn run_peer_session(
                         // TODO: Build and send withdrawal UPDATE
                         debug!(
                             prefix = %prefix,
-                            peer = %peer_addr,
+                            peer = %peer_addr_display,
                             "API route withdrawal - withdrawal UPDATEs not yet implemented"
                         );
                     }
