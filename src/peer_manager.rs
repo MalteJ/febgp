@@ -394,7 +394,7 @@ mod tests {
     async fn create_test_fixtures() -> (PeerManagerHandle, Arc<RwLock<DaemonState>>) {
         // Create RIB
         let (rib_tx, rib_rx) = mpsc::channel::<RibCommand>(32);
-        let (rib_actor, event_tx) = RibActor::new(rib_rx, false).unwrap();
+        let (rib_actor, event_tx) = RibActor::new(rib_rx, false, None, None).unwrap();
         let rib_handle = RibHandle::new(rib_tx, event_tx);
         tokio::spawn(rib_actor.run());
 

@@ -17,6 +17,10 @@ prefixes = []
 # Install routes into Linux routing table via netlink (optional)
 # install_routes = false
 
+# Source IP for installed routes (optional, requires install_routes = true)
+# route_source_v4 = "10.0.0.1"    # prefsrc for IPv4 BGP routes
+# route_source_v6 = "2001:db8::1" # prefsrc for IPv6 BGP routes
+
 # Address families (optional)
 # ipv4_unicast = false       # enable IPv4 unicast (default: false)
 # ipv6_unicast = true        # enable IPv6 unicast (default: true)

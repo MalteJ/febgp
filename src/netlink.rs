@@ -32,6 +32,10 @@ pub struct NextHop {
 /// of creating a new connection for each operation.
 pub struct NetlinkHandle {
     handle: Handle,
+    /// Preferred source IP for IPv4 routes (prefsrc attribute).
+    source_v4: Option<Ipv4Addr>,
+    /// Preferred source IP for IPv6 routes (prefsrc attribute).
+    source_v6: Option<Ipv6Addr>,
 }
 
 impl NetlinkHandle {
@@ -39,10 +43,15 @@ impl NetlinkHandle {
     ///
     /// This establishes a connection to the netlink socket and spawns
     /// the connection task in the background.
-    pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    ///
+    /// Optionally accepts source IPs to set as prefsrc on installed routes.
+    pub fn new(
+        source_v4: Option<Ipv4Addr>,
+        source_v6: Option<Ipv6Addr>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
-        Ok(Self { handle })
+        Ok(Self { handle, source_v4, source_v6 })
     }
 
     /// Set the nexthops for a prefix (create or replace).
@@ -140,11 +149,16 @@ impl NetlinkHandle {
             nh_entries.push(entry);
         }
 
-        let message = RouteMessageBuilder::<Ipv4Addr>::new()
+        let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
             .destination_prefix(dest, prefix_len)
             .protocol(RTPROT_BGP)
-            .multipath(nh_entries)
-            .build();
+            .multipath(nh_entries);
+
+        if let Some(src) = self.source_v4 {
+            builder = builder.pref_source(src);
+        }
+
+        let message = builder.build();
 
         self.handle
             .route()
@@ -192,11 +206,16 @@ impl NetlinkHandle {
             nh_entries.push(builder.build());
         }
 
-        let message = RouteMessageBuilder::<Ipv6Addr>::new()
+        let mut builder = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix(dest, prefix_len)
             .protocol(RTPROT_BGP)
-            .multipath(nh_entries)
-            .build();
+            .multipath(nh_entries);
+
+        if let Some(src) = self.source_v6 {
+            builder = builder.pref_source(src);
+        }
+
+        let message = builder.build();
 
         self.handle
             .route()

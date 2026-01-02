@@ -37,6 +37,14 @@ pub struct Config {
     /// Default: false.
     #[serde(default)]
     pub install_routes: bool,
+    /// Source IP for installed IPv4 routes (prefsrc attribute).
+    /// If set, all IPv4 BGP routes will use this as their source address.
+    #[serde(default)]
+    pub route_source_v4: Option<Ipv4Addr>,
+    /// Source IP for installed IPv6 routes (prefsrc attribute).
+    /// If set, all IPv6 BGP routes will use this as their source address.
+    #[serde(default)]
+    pub route_source_v6: Option<Ipv6Addr>,
 }
 
 fn default_true() -> bool {
@@ -63,6 +71,8 @@ impl Default for Config {
             ipv4_unicast: false,
             ipv6_unicast: true,
             install_routes: false,
+            route_source_v4: None,
+            route_source_v6: None,
         }
     }
 }

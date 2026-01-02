@@ -1,8 +1,6 @@
 [Unit]
 Description=FeBGP - BGP daemon in Rust
 Documentation=https://github.com/maltej/febgp
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple

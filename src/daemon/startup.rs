@@ -50,12 +50,23 @@ pub async fn init_daemon_components(
     );
     if install_routes {
         info!("Route installation: enabled");
+        if let Some(src) = config.route_source_v4 {
+            info!(source = %src, "IPv4 route source: {}", src);
+        }
+        if let Some(src) = config.route_source_v6 {
+            info!(source = %src, "IPv6 route source: {}", src);
+        }
     }
 
     // Create RibActor with command channel
     let (rib_tx, rib_rx) = mpsc::channel::<RibCommand>(256);
-    let (rib_actor, route_event_tx) = RibActor::new(rib_rx, install_routes)
-        .map_err(|e| format!("Failed to create RibActor: {}", e))?;
+    let (rib_actor, route_event_tx) = RibActor::new(
+        rib_rx,
+        install_routes,
+        config.route_source_v4,
+        config.route_source_v6,
+    )
+    .map_err(|e| format!("Failed to create RibActor: {}", e))?;
     let rib_handle = RibHandle::new(rib_tx, route_event_tx);
 
     tokio::spawn(async move {

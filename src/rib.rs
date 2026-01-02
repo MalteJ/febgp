@@ -186,11 +186,16 @@ impl Rib {
     ///
     /// This establishes a persistent netlink connection that will be reused
     /// for all route install/remove operations.
-    pub fn with_netlink() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    ///
+    /// Optionally accepts source IPs to set as prefsrc on installed routes.
+    pub fn with_netlink(
+        source_v4: Option<std::net::Ipv4Addr>,
+        source_v6: Option<std::net::Ipv6Addr>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
             routes: Vec::new(),
             api_routes: Vec::new(),
-            netlink: Some(NetlinkHandle::new()?),
+            netlink: Some(NetlinkHandle::new(source_v4, source_v6)?),
         })
     }
 
@@ -462,13 +467,17 @@ impl RibActor {
     /// If `install_routes` is true, routes will be installed into the
     /// Linux kernel via netlink.
     ///
+    /// Optionally accepts source IPs to set as prefsrc on installed routes.
+    ///
     /// Returns the actor and a broadcast sender that can be cloned for subscribers.
     pub fn new(
         command_rx: mpsc::Receiver<RibCommand>,
         install_routes: bool,
+        source_v4: Option<std::net::Ipv4Addr>,
+        source_v6: Option<std::net::Ipv6Addr>,
     ) -> Result<(Self, broadcast::Sender<RouteEvent>), Box<dyn std::error::Error + Send + Sync>> {
         let rib = if install_routes {
-            Rib::with_netlink()?
+            Rib::with_netlink(source_v4, source_v6)?
         } else {
             Rib::new()
         };
@@ -1072,7 +1081,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let (tx, rx) = mpsc::channel::<RibCommand>(32);
-        let (actor, event_tx) = RibActor::new(rx, false).unwrap();
+        let (actor, event_tx) = RibActor::new(rx, false, None, None).unwrap();
 
         // Subscribe to events before spawning actor
         let mut event_rx = event_tx.subscribe();
@@ -1109,7 +1118,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let (tx, rx) = mpsc::channel::<RibCommand>(32);
-        let (actor, event_tx) = RibActor::new(rx, false).unwrap();
+        let (actor, event_tx) = RibActor::new(rx, false, None, None).unwrap();
 
         // Subscribe to events
         let mut event_rx = event_tx.subscribe();
@@ -1152,7 +1161,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let (tx, rx) = mpsc::channel::<RibCommand>(32);
-        let (actor, event_tx) = RibActor::new(rx, false).unwrap();
+        let (actor, event_tx) = RibActor::new(rx, false, None, None).unwrap();
 
         // Subscribe to events
         let mut event_rx = event_tx.subscribe();
@@ -1200,7 +1209,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let (tx, rx) = mpsc::channel::<RibCommand>(32);
-        let (actor, event_tx) = RibActor::new(rx, false).unwrap();
+        let (actor, event_tx) = RibActor::new(rx, false, None, None).unwrap();
 
         tokio::spawn(actor.run());
         let handle = RibHandle::new(tx, event_tx);
@@ -1232,7 +1241,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let (tx, rx) = mpsc::channel::<RibCommand>(32);
-        let (actor, event_tx) = RibActor::new(rx, false).unwrap();
+        let (actor, event_tx) = RibActor::new(rx, false, None, None).unwrap();
 
         tokio::spawn(actor.run());
         let handle = RibHandle::new(tx, event_tx);
