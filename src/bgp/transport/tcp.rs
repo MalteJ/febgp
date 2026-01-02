@@ -4,14 +4,14 @@ use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::unix::io::AsRawFd;
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
 use super::{BgpTransport, TransportError, TransportResult};
-use crate::bgp::message::{Message, BGP_HEADER_LEN, BGP_MARKER};
+use crate::bgp::message::{Message, MessageType, Notification, OpenMessage, BGP_HEADER_LEN, BGP_MARKER};
 
 /// Default timeout for connect operations.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -184,8 +184,6 @@ impl TcpTransport {
 
     /// Parse a BGP message from its type and body.
     fn parse_message(&self, msg_type: u8, body: Vec<u8>) -> TransportResult<Message> {
-        use crate::bgp::message::{MessageType, OpenMessage};
-
         let msg_type = MessageType::try_from(msg_type).map_err(|e| {
             TransportError::InvalidMessage(format!("Invalid message type: {}", e))
         })?;
@@ -201,14 +199,10 @@ impl TcpTransport {
             MessageType::Update => Ok(Message::Update(Bytes::from(body))),
             MessageType::Notification => {
                 let mut buf = Bytes::from(body);
-                let code = if buf.has_remaining() { buf.get_u8() } else { 0 };
-                let subcode = if buf.has_remaining() { buf.get_u8() } else { 0 };
-                let data = if buf.has_remaining() {
-                    buf.to_vec()
-                } else {
-                    Vec::new()
-                };
-                Ok(Message::Notification { code, subcode, data })
+                let notification = Notification::decode(&mut buf).map_err(|e| {
+                    TransportError::InvalidMessage(format!("Invalid NOTIFICATION: {}", e))
+                })?;
+                Ok(Message::Notification(notification))
             }
             MessageType::Keepalive => Ok(Message::Keepalive),
         }
@@ -383,10 +377,10 @@ mod tests {
         let msg = transport.parse_message(3, body).unwrap();
 
         match msg {
-            Message::Notification { code, subcode, data } => {
-                assert_eq!(code, 6);
-                assert_eq!(subcode, 4);
-                assert_eq!(data, vec![0x01, 0x02]);
+            Message::Notification(n) => {
+                assert_eq!(n.code, 6);
+                assert_eq!(n.subcode, 4);
+                assert_eq!(n.data, vec![0x01, 0x02]);
             }
             _ => panic!("Expected Notification"),
         }

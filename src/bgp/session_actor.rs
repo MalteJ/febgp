@@ -304,16 +304,16 @@ impl<T: BgpTransport> SessionActor<T> {
                         );
                         FsmEvent::Message(MessageEvent::UpdateMsg(data.clone()))
                     }
-                    Message::Notification { code, subcode, data } => {
+                    Message::Notification(n) => {
                         warn!(
                             peer = %self.transport.peer_addr(),
                             msg_type = "NOTIFICATION",
-                            code = code,
-                            subcode = subcode,
+                            code = n.code,
+                            subcode = n.subcode,
                             "Received NOTIFICATION from peer (code: {}, subcode: {})",
-                            code, subcode
+                            n.code, n.subcode
                         );
-                        FsmEvent::Message(MessageEvent::NotifMsg { code: *code, subcode: *subcode, data: data.clone() })
+                        FsmEvent::Message(MessageEvent::NotifMsg { code: n.code, subcode: n.subcode, data: n.data.clone() })
                     }
                 };
                 self.process_event(event).await;
@@ -555,6 +555,7 @@ impl<T: BgpTransport> SessionActor<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bgp::message::Notification;
     use crate::bgp::transport::mock::MockTransport;
     use std::net::Ipv4Addr;
     use tokio::time::timeout;
@@ -656,11 +657,7 @@ mod tests {
     async fn test_session_actor_receives_notification() {
         let mut transport = MockTransport::new();
         transport.queue_receive(Message::Open(peer_open()));
-        transport.queue_receive(Message::Notification {
-            code: 6,
-            subcode: 4,
-            data: vec![],
-        });
+        transport.queue_receive(Message::Notification(Notification::new(6, 4, vec![])));
 
         let (cmd_tx, cmd_rx) = mpsc::channel(10);
         let (event_tx, mut event_rx) = mpsc::channel(10);

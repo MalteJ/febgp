@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::Ipv4Addr;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -33,23 +33,31 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
-/// BGP message header for synchronous I/O.
+/// BGP message header.
 ///
-/// Used by the legacy `Session` struct and unit tests.
-/// The async `TcpTransport` handles header parsing internally.
-#[allow(dead_code)]
-#[derive(Debug)]
+/// Used for parsing incoming messages. The header contains the 16-byte marker,
+/// 2-byte length, and 1-byte message type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     pub length: u16,
     pub msg_type: MessageType,
 }
 
-#[allow(dead_code)]
 impl Header {
-    pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let mut marker = [0u8; 16];
-        reader.read_exact(&mut marker)?;
+    /// Decode a BGP header from a buffer.
+    ///
+    /// The buffer must contain at least `BGP_HEADER_LEN` (19) bytes.
+    pub fn decode(data: &mut impl Buf) -> io::Result<Self> {
+        if data.remaining() < BGP_HEADER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Header too short",
+            ));
+        }
 
+        // Verify marker
+        let mut marker = [0u8; 16];
+        data.copy_to_slice(&mut marker);
         if marker != BGP_MARKER {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -57,22 +65,24 @@ impl Header {
             ));
         }
 
-        let mut buf = [0u8; 2];
-        reader.read_exact(&mut buf)?;
-        let length = u16::from_be_bytes(buf);
-
-        let mut type_buf = [0u8; 1];
-        reader.read_exact(&mut type_buf)?;
-        let msg_type = MessageType::try_from(type_buf[0])?;
+        let length = data.get_u16();
+        let msg_type = MessageType::try_from(data.get_u8())?;
 
         Ok(Header { length, msg_type })
     }
 
-    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&BGP_MARKER)?;
-        writer.write_all(&self.length.to_be_bytes())?;
-        writer.write_all(&[self.msg_type as u8])?;
-        Ok(())
+    /// Encode the header into a buffer.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_slice(&BGP_MARKER);
+        buf.put_u16(self.length);
+        buf.put_u8(self.msg_type as u8);
+    }
+
+    /// Encode the header and return as Bytes.
+    pub fn to_bytes(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(BGP_HEADER_LEN);
+        self.encode(&mut buf);
+        buf.freeze()
     }
 }
 
@@ -315,48 +325,150 @@ impl KeepaliveMessage {
     }
 }
 
+/// BGP NOTIFICATION message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    pub code: u8,
+    pub subcode: u8,
+    pub data: Vec<u8>,
+}
+
+impl Notification {
+    /// Create a new NOTIFICATION message.
+    pub fn new(code: u8, subcode: u8, data: Vec<u8>) -> Self {
+        Self { code, subcode, data }
+    }
+
+    /// Encode the NOTIFICATION body (without header).
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(2 + self.data.len());
+        buf.put_u8(self.code);
+        buf.put_u8(self.subcode);
+        buf.put_slice(&self.data);
+        buf.freeze()
+    }
+
+    /// Decode a NOTIFICATION from a body buffer.
+    pub fn decode(data: &mut impl Buf) -> io::Result<Self> {
+        let code = if data.has_remaining() {
+            data.get_u8()
+        } else {
+            0
+        };
+        let subcode = if data.has_remaining() {
+            data.get_u8()
+        } else {
+            0
+        };
+        let notification_data = if data.has_remaining() {
+            let mut v = vec![0u8; data.remaining()];
+            data.copy_to_slice(&mut v);
+            v
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            code,
+            subcode,
+            data: notification_data,
+        })
+    }
+
+    /// Encode as a complete BGP message with header.
+    pub fn to_bytes(&self) -> Bytes {
+        let body = self.encode();
+        let length = (BGP_HEADER_LEN + body.len()) as u16;
+
+        let mut buf = BytesMut::with_capacity(length as usize);
+        buf.put_slice(&BGP_MARKER);
+        buf.put_u16(length);
+        buf.put_u8(MessageType::Notification as u8);
+        buf.put(body);
+        buf.freeze()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Open(OpenMessage),
     Update(Bytes),
-    Notification { code: u8, subcode: u8, data: Vec<u8> },
+    Notification(Notification),
     Keepalive,
 }
 
 impl Message {
-    /// Read a BGP message from a synchronous reader.
+    /// Decode a complete BGP message (including header) from a buffer.
     ///
-    /// Used by the legacy `Session` struct and unit tests.
-    /// The async `TcpTransport` handles message reading internally.
-    #[allow(dead_code)]
-    pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let header = Header::read(reader)?;
+    /// The buffer must contain the full message including the 19-byte header.
+    pub fn decode(data: &mut impl Buf) -> io::Result<Self> {
+        let header = Header::decode(data)?;
 
         let body_len = header.length as usize - BGP_HEADER_LEN;
-        let mut body = vec![0u8; body_len];
-        if body_len > 0 {
-            reader.read_exact(&mut body)?;
+
+        if data.remaining() < body_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Message body too short: expected {} bytes, got {}",
+                    body_len,
+                    data.remaining()
+                ),
+            ));
         }
+
+        let mut body = data.copy_to_bytes(body_len);
 
         match header.msg_type {
             MessageType::Open => {
-                let mut buf = Bytes::from(body);
-                let open = OpenMessage::decode(&mut buf)?;
+                let open = OpenMessage::decode(&mut body)?;
                 Ok(Message::Open(open))
             }
-            MessageType::Update => Ok(Message::Update(Bytes::from(body))),
+            MessageType::Update => Ok(Message::Update(body)),
             MessageType::Notification => {
-                let mut buf = Bytes::from(body);
-                let code = if buf.has_remaining() { buf.get_u8() } else { 0 };
-                let subcode = if buf.has_remaining() { buf.get_u8() } else { 0 };
-                let data = if buf.has_remaining() {
-                    buf.to_vec()
-                } else {
-                    Vec::new()
-                };
-                Ok(Message::Notification { code, subcode, data })
+                let notification = Notification::decode(&mut body)?;
+                Ok(Message::Notification(notification))
             }
             MessageType::Keepalive => Ok(Message::Keepalive),
+        }
+    }
+
+    /// Decode a BGP message body (without header) given the message type.
+    ///
+    /// Use this when the header has already been parsed separately.
+    pub fn decode_body(msg_type: MessageType, body: &mut impl Buf) -> io::Result<Self> {
+        match msg_type {
+            MessageType::Open => {
+                let open = OpenMessage::decode(body)?;
+                Ok(Message::Open(open))
+            }
+            MessageType::Update => {
+                let data = body.copy_to_bytes(body.remaining());
+                Ok(Message::Update(data))
+            }
+            MessageType::Notification => {
+                let notification = Notification::decode(body)?;
+                Ok(Message::Notification(notification))
+            }
+            MessageType::Keepalive => Ok(Message::Keepalive),
+        }
+    }
+
+    /// Encode the message to bytes (including header).
+    pub fn to_bytes(&self) -> Bytes {
+        match self {
+            Message::Open(open) => open.to_bytes(),
+            Message::Update(body) => {
+                let length = (BGP_HEADER_LEN + body.len()) as u16;
+                let mut buf = BytesMut::with_capacity(length as usize);
+                buf.put_slice(&BGP_MARKER);
+                buf.put_u16(length);
+                buf.put_u8(MessageType::Update as u8);
+                buf.put_slice(body);
+                buf.freeze()
+            }
+            Message::Notification(n) => n.to_bytes(),
+            Message::Keepalive => KeepaliveMessage::to_bytes(),
         }
     }
 }
@@ -364,7 +476,6 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     // ==================== MessageType Tests ====================
 
@@ -386,19 +497,17 @@ mod tests {
     // ==================== Header Tests ====================
 
     #[test]
-    fn test_header_write_read_roundtrip() {
+    fn test_header_encode_decode_roundtrip() {
         let header = Header {
             length: 29,
             msg_type: MessageType::Open,
         };
 
-        let mut buf = Vec::new();
-        header.write(&mut buf).unwrap();
+        let encoded = header.to_bytes();
+        assert_eq!(encoded.len(), BGP_HEADER_LEN);
 
-        assert_eq!(buf.len(), BGP_HEADER_LEN);
-
-        let mut cursor = Cursor::new(buf);
-        let decoded = Header::read(&mut cursor).unwrap();
+        let mut buf = encoded;
+        let decoded = Header::decode(&mut buf).unwrap();
 
         assert_eq!(decoded.length, 29);
         assert_eq!(decoded.msg_type, MessageType::Open);
@@ -411,8 +520,7 @@ mod tests {
             msg_type: MessageType::Keepalive,
         };
 
-        let mut buf = Vec::new();
-        header.write(&mut buf).unwrap();
+        let buf = header.to_bytes();
 
         // Check marker (16 bytes of 0xFF)
         assert_eq!(&buf[0..16], &BGP_MARKER);
@@ -424,13 +532,13 @@ mod tests {
 
     #[test]
     fn test_header_invalid_marker() {
-        let mut buf = vec![0x00; 19]; // Invalid marker (not all 0xFF)
-        buf[16] = 0x00;
-        buf[17] = 0x13;
-        buf[18] = 4;
+        let mut data = BytesMut::from(&[0x00u8; 19][..]); // Invalid marker (not all 0xFF)
+        data[16] = 0x00;
+        data[17] = 0x13;
+        data[18] = 4;
 
-        let mut cursor = Cursor::new(buf);
-        let result = Header::read(&mut cursor);
+        let mut buf = data.freeze();
+        let result = Header::decode(&mut buf);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid BGP marker"));
@@ -438,15 +546,23 @@ mod tests {
 
     #[test]
     fn test_header_invalid_message_type() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&BGP_MARKER);
-        buf.extend_from_slice(&19u16.to_be_bytes());
-        buf.push(99); // Invalid message type
+        let mut data = BytesMut::new();
+        data.put_slice(&BGP_MARKER);
+        data.put_u16(19);
+        data.put_u8(99); // Invalid message type
 
-        let mut cursor = Cursor::new(buf);
-        let result = Header::read(&mut cursor);
+        let mut buf = data.freeze();
+        let result = Header::decode(&mut buf);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_header_too_short() {
+        let mut buf = Bytes::from_static(&[0xFF; 10]); // Only 10 bytes
+        let result = Header::decode(&mut buf);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
     }
 
     // ==================== Capability Tests ====================
@@ -679,25 +795,51 @@ mod tests {
         assert_eq!(bytes[18], MessageType::Keepalive as u8);
     }
 
-    // ==================== Message::read Tests ====================
+    // ==================== Notification Tests ====================
 
     #[test]
-    fn test_message_read_keepalive() {
-        let bytes = KeepaliveMessage::to_bytes();
-        let mut cursor = Cursor::new(bytes.to_vec());
+    fn test_notification_encode_decode_roundtrip() {
+        let notification = Notification::new(6, 4, vec![0x01, 0x02, 0x03]);
+        let encoded = notification.encode();
 
-        let msg = Message::read(&mut cursor).unwrap();
+        let mut buf = encoded;
+        let decoded = Notification::decode(&mut buf).unwrap();
+
+        assert_eq!(decoded.code, 6);
+        assert_eq!(decoded.subcode, 4);
+        assert_eq!(decoded.data, vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_notification_to_bytes_format() {
+        let notification = Notification::new(2, 1, vec![]);
+        let bytes = notification.to_bytes();
+
+        // Header
+        assert_eq!(&bytes[0..16], &BGP_MARKER);
+        assert_eq!(u16::from_be_bytes([bytes[16], bytes[17]]), 21); // 19 + 2
+        assert_eq!(bytes[18], MessageType::Notification as u8);
+        // Body
+        assert_eq!(bytes[19], 2); // code
+        assert_eq!(bytes[20], 1); // subcode
+    }
+
+    // ==================== Message::decode Tests ====================
+
+    #[test]
+    fn test_message_decode_keepalive() {
+        let mut bytes = KeepaliveMessage::to_bytes();
+        let msg = Message::decode(&mut bytes).unwrap();
 
         assert!(matches!(msg, Message::Keepalive));
     }
 
     #[test]
-    fn test_message_read_open() {
+    fn test_message_decode_open() {
         let open = OpenMessage::new(65001, 180, Ipv4Addr::new(1, 2, 3, 4));
-        let bytes = open.to_bytes();
-        let mut cursor = Cursor::new(bytes.to_vec());
+        let mut bytes = open.to_bytes();
 
-        let msg = Message::read(&mut cursor).unwrap();
+        let msg = Message::decode(&mut bytes).unwrap();
 
         match msg {
             Message::Open(decoded) => {
@@ -710,18 +852,18 @@ mod tests {
     }
 
     #[test]
-    fn test_message_read_update() {
+    fn test_message_decode_update() {
         let update_body: &[u8] = &[0x00, 0x00, 0x00, 0x00]; // Minimal UPDATE body
         let length = (BGP_HEADER_LEN + update_body.len()) as u16;
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&BGP_MARKER);
-        bytes.extend_from_slice(&length.to_be_bytes());
-        bytes.push(MessageType::Update as u8);
-        bytes.extend_from_slice(update_body);
+        let mut data = BytesMut::new();
+        data.put_slice(&BGP_MARKER);
+        data.put_u16(length);
+        data.put_u8(MessageType::Update as u8);
+        data.put_slice(update_body);
 
-        let mut cursor = Cursor::new(bytes);
-        let msg = Message::read(&mut cursor).unwrap();
+        let mut bytes = data.freeze();
+        let msg = Message::decode(&mut bytes).unwrap();
 
         match msg {
             Message::Update(body) => {
@@ -732,104 +874,164 @@ mod tests {
     }
 
     #[test]
-    fn test_message_read_notification() {
+    fn test_message_decode_notification() {
         let code = 6u8; // Cease
         let subcode = 4u8; // Administrative Reset
-        let data = vec![0x01, 0x02, 0x03];
+        let notification_data = vec![0x01, 0x02, 0x03];
 
-        let body_len = 2 + data.len();
+        let body_len = 2 + notification_data.len();
         let length = (BGP_HEADER_LEN + body_len) as u16;
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&BGP_MARKER);
-        bytes.extend_from_slice(&length.to_be_bytes());
-        bytes.push(MessageType::Notification as u8);
-        bytes.push(code);
-        bytes.push(subcode);
-        bytes.extend_from_slice(&data);
+        let mut data = BytesMut::new();
+        data.put_slice(&BGP_MARKER);
+        data.put_u16(length);
+        data.put_u8(MessageType::Notification as u8);
+        data.put_u8(code);
+        data.put_u8(subcode);
+        data.put_slice(&notification_data);
 
-        let mut cursor = Cursor::new(bytes);
-        let msg = Message::read(&mut cursor).unwrap();
+        let mut bytes = data.freeze();
+        let msg = Message::decode(&mut bytes).unwrap();
 
         match msg {
-            Message::Notification {
-                code: c,
-                subcode: s,
-                data: d,
-            } => {
-                assert_eq!(c, 6);
-                assert_eq!(s, 4);
-                assert_eq!(d, vec![0x01, 0x02, 0x03]);
+            Message::Notification(n) => {
+                assert_eq!(n.code, 6);
+                assert_eq!(n.subcode, 4);
+                assert_eq!(n.data, vec![0x01, 0x02, 0x03]);
             }
             _ => panic!("Expected Notification message"),
         }
     }
 
     #[test]
-    fn test_message_read_notification_minimal() {
+    fn test_message_decode_notification_minimal() {
         // Notification with only code and subcode, no data
         let length = (BGP_HEADER_LEN + 2) as u16;
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&BGP_MARKER);
-        bytes.extend_from_slice(&length.to_be_bytes());
-        bytes.push(MessageType::Notification as u8);
-        bytes.push(2); // code
-        bytes.push(1); // subcode
+        let mut data = BytesMut::new();
+        data.put_slice(&BGP_MARKER);
+        data.put_u16(length);
+        data.put_u8(MessageType::Notification as u8);
+        data.put_u8(2); // code
+        data.put_u8(1); // subcode
 
-        let mut cursor = Cursor::new(bytes);
-        let msg = Message::read(&mut cursor).unwrap();
+        let mut bytes = data.freeze();
+        let msg = Message::decode(&mut bytes).unwrap();
 
         match msg {
-            Message::Notification { code, subcode, data } => {
-                assert_eq!(code, 2);
-                assert_eq!(subcode, 1);
-                assert!(data.is_empty());
+            Message::Notification(n) => {
+                assert_eq!(n.code, 2);
+                assert_eq!(n.subcode, 1);
+                assert!(n.data.is_empty());
             }
             _ => panic!("Expected Notification message"),
         }
     }
 
     #[test]
-    fn test_message_read_notification_empty_body() {
+    fn test_message_decode_notification_empty_body() {
         // Edge case: Notification with empty body (code and subcode default to 0)
         let length = BGP_HEADER_LEN as u16;
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&BGP_MARKER);
-        bytes.extend_from_slice(&length.to_be_bytes());
-        bytes.push(MessageType::Notification as u8);
+        let mut data = BytesMut::new();
+        data.put_slice(&BGP_MARKER);
+        data.put_u16(length);
+        data.put_u8(MessageType::Notification as u8);
 
-        let mut cursor = Cursor::new(bytes);
-        let msg = Message::read(&mut cursor).unwrap();
+        let mut bytes = data.freeze();
+        let msg = Message::decode(&mut bytes).unwrap();
 
         match msg {
-            Message::Notification { code, subcode, data } => {
-                assert_eq!(code, 0);
-                assert_eq!(subcode, 0);
-                assert!(data.is_empty());
+            Message::Notification(n) => {
+                assert_eq!(n.code, 0);
+                assert_eq!(n.subcode, 0);
+                assert!(n.data.is_empty());
             }
             _ => panic!("Expected Notification message"),
         }
     }
 
     #[test]
-    fn test_message_read_multiple_sequential() {
-        // Test reading multiple messages from a stream
-        let mut bytes = BytesMut::new();
-        bytes.put(KeepaliveMessage::to_bytes());
-        bytes.put(KeepaliveMessage::to_bytes());
-        bytes.put(OpenMessage::new(65001, 180, Ipv4Addr::new(1, 1, 1, 1)).to_bytes());
+    fn test_message_decode_multiple_sequential() {
+        // Test reading multiple messages from a buffer
+        let mut data = BytesMut::new();
+        data.put(KeepaliveMessage::to_bytes());
+        data.put(KeepaliveMessage::to_bytes());
+        data.put(OpenMessage::new(65001, 180, Ipv4Addr::new(1, 1, 1, 1)).to_bytes());
 
-        let mut cursor = Cursor::new(bytes.to_vec());
+        let mut bytes = data.freeze();
 
-        let msg1 = Message::read(&mut cursor).unwrap();
+        let msg1 = Message::decode(&mut bytes).unwrap();
         assert!(matches!(msg1, Message::Keepalive));
 
-        let msg2 = Message::read(&mut cursor).unwrap();
+        let msg2 = Message::decode(&mut bytes).unwrap();
         assert!(matches!(msg2, Message::Keepalive));
 
-        let msg3 = Message::read(&mut cursor).unwrap();
+        let msg3 = Message::decode(&mut bytes).unwrap();
         assert!(matches!(msg3, Message::Open(_)));
+
+        // Buffer should be exhausted
+        assert_eq!(bytes.remaining(), 0);
+    }
+
+    #[test]
+    fn test_message_decode_body_short() {
+        // Header claims body length but buffer is too short
+        let mut data = BytesMut::new();
+        data.put_slice(&BGP_MARKER);
+        data.put_u16(100); // Claims 100 bytes total
+        data.put_u8(MessageType::Update as u8);
+        // But we only have the header, no body
+
+        let mut bytes = data.freeze();
+        let result = Message::decode(&mut bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_message_to_bytes_roundtrip() {
+        // Test that Message::to_bytes and Message::decode are inverses
+        let messages = vec![
+            Message::Keepalive,
+            Message::Open(OpenMessage::new(65001, 180, Ipv4Addr::new(10, 0, 0, 1))),
+            Message::Update(Bytes::from_static(&[0x00, 0x00, 0x00, 0x00])),
+            Message::Notification(Notification::new(6, 4, vec![0x01, 0x02])),
+        ];
+
+        for original in messages {
+            let mut encoded = original.to_bytes();
+            let decoded = Message::decode(&mut encoded).unwrap();
+
+            match (&original, &decoded) {
+                (Message::Keepalive, Message::Keepalive) => {}
+                (Message::Open(o1), Message::Open(o2)) => {
+                    assert_eq!(o1.asn, o2.asn);
+                    assert_eq!(o1.hold_time, o2.hold_time);
+                    assert_eq!(o1.router_id, o2.router_id);
+                }
+                (Message::Update(u1), Message::Update(u2)) => {
+                    assert_eq!(&u1[..], &u2[..]);
+                }
+                (Message::Notification(n1), Message::Notification(n2)) => {
+                    assert_eq!(n1, n2);
+                }
+                _ => panic!("Message type mismatch"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_message_decode_body() {
+        // Test decode_body with separate header parsing
+        let open = OpenMessage::new(65001, 180, Ipv4Addr::new(1, 2, 3, 4));
+        let mut body = open.encode();
+
+        let msg = Message::decode_body(MessageType::Open, &mut body).unwrap();
+        match msg {
+            Message::Open(decoded) => {
+                assert_eq!(decoded.asn, 65001);
+            }
+            _ => panic!("Expected Open message"),
+        }
     }
 }
