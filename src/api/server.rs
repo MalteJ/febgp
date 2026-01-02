@@ -6,9 +6,10 @@ use tonic::{Request, Response, Status};
 
 use super::proto::{
     route_update::UpdateType, AddPeerRequest, AddPeerResponse, AddRouteRequest, AddRouteResponse,
-    Empty, Neighbor, RemovePeerRequest, RemovePeerResponse, Route, RouteUpdate, RoutesResponse,
-    StatusResponse, WithdrawRouteRequest, WithdrawRouteResponse,
+    Empty, MetricsResponse, Neighbor, RemovePeerRequest, RemovePeerResponse, Route, RouteUpdate,
+    RoutesResponse, StatusResponse, WithdrawRouteRequest, WithdrawRouteResponse,
 };
+use crate::metrics;
 use super::FebgpService;
 use crate::bgp::SessionState;
 use crate::config::PeerConfig;
@@ -337,5 +338,15 @@ impl FebgpService for FebgpServiceImpl {
                 error: e.to_string(),
             })),
         }
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<MetricsResponse>, Status> {
+        let metrics_text = metrics::gather();
+        Ok(Response::new(MetricsResponse {
+            metrics: metrics_text,
+        }))
     }
 }

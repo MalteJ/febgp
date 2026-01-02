@@ -23,6 +23,9 @@ service FebgpService {
 
     // Remove a BGP peer dynamically
     rpc RemovePeer(RemovePeerRequest) returns (RemovePeerResponse);
+
+    // Get Prometheus metrics
+    rpc GetMetrics(Empty) returns (MetricsResponse);
 }
 
 message Empty {}
@@ -108,4 +111,9 @@ message RemovePeerRequest {
 message RemovePeerResponse {
     bool success = 1;
     string error = 2;
+}
+
+// Prometheus metrics response
+message MetricsResponse {
+    string metrics = 1;  // Prometheus text format
 }

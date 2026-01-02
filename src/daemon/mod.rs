@@ -17,7 +17,8 @@ use crate::bgp::{
     build_ipv4_update, build_ipv6_update, parse_update, FsmConfig, FsmState, SessionActor,
     SessionCommand, SessionEvent, TcpTransport,
 };
-use crate::config::{Config, parse_peer_address, PeerConfig, SessionMode};
+use crate::config::{parse_peer_address, Config, PeerConfig, SessionMode};
+use crate::metrics;
 use crate::neighbor_discovery::get_interface_link_local;
 use crate::peer_manager::PeerManagerHandle;
 use crate::rib::{RibHandle, RouteEvent, LOCAL_PEER_IDX};
@@ -227,8 +228,14 @@ pub async fn run_peer_session(
                 let Some(event) = event else { break };
 
                 match event {
-                    SessionEvent::StateChange { to, .. } => {
+                    SessionEvent::StateChange { from, to } => {
                         update_peer_state(&state, peer_idx, to.into()).await;
+
+                        // Record metrics
+                        let state_str = format!("{:?}", to);
+                        let from_str = format!("{:?}", from);
+                        metrics::record_session_state(&peer.interface, &state_str);
+                        metrics::record_state_change(&peer.interface, &from_str, &state_str);
 
                         if to == FsmState::Established {
                             established_at = Some(Instant::now());

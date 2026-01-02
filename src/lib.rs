@@ -3,6 +3,7 @@ pub mod bgp;
 pub mod config;
 pub mod daemon;
 pub mod error;
+pub mod metrics;
 pub mod neighbor_discovery;
 pub mod netlink;
 pub mod peer_manager;

@@ -10,6 +10,7 @@ use tracing::{error, info};
 use febgp::api;
 use febgp::api::server::FebgpServiceImpl;
 use febgp::config::Config;
+use febgp::metrics;
 use febgp::daemon::startup::{
     init_daemon_components, spawn_bgp_listener, spawn_neighbor_handler, spawn_shutdown_handler,
 };
@@ -72,6 +73,9 @@ async fn run_daemon_async(
     socket_path: &str,
     install_routes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize metrics
+    metrics::init();
+
     // Initialize all daemon components
     let components = init_daemon_components(config, install_routes).await?;
 
