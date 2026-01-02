@@ -10,7 +10,7 @@ use common::gobgp::{get_link_local_address, GobgpConfig, GobgpInstance, GobgpNei
 use common::netns::{create_veth_pair, NetNs};
 
 fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    nix::unistd::geteuid().is_root()
 }
 
 /// Test that FeBGP can establish a BGP session with GoBGP using link-local addresses.

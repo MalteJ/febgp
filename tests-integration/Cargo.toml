@@ -8,7 +8,7 @@ publish = false
 febgp = { path = ".." }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-libc = { workspace = true }
+nix = { version = "0.30.1", features = ["user"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 [[bin]]

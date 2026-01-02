@@ -9,7 +9,7 @@ readme = "README.md"
 
 [package.metadata.deb]
 maintainer = "FeBGP Maintainers"
-copyright = "2024 FeBGP Authors"
+copyright = "2026 FeBGP Authors"
 extended-description = """\
 A BGP daemon written in Rust, designed for BGP unnumbered deployments.
 Supports BGP-4, 4-octet ASN, IPv6, and FIB installation via netlink."""
@@ -42,9 +42,8 @@ tonic-prost = "0.14"
 prost = "0.14"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 hyper-util = "0.1"
-nix = { version = "0.30.1", features = ["net"] }
-socket2 = { version = "0.5", features = ["all"] }
-libc = "0.2"
+nix = { version = "0.30.1", features = ["net", "user"] }
+socket2 = "0.6"
 rtnetlink = "0.20"
 netlink-packet-route = "0.28"
 futures = "0.3"
@@ -65,4 +64,3 @@ members = ["tests-integration"]
 [workspace.dependencies]
 serde_json = "1"
 tempfile = "3"
-libc = "0.2"

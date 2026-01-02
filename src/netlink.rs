@@ -12,8 +12,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use futures::TryStreamExt;
 use netlink_packet_route::route::{RouteMessage, RouteProtocol};
 use netlink_packet_route::AddressFamily;
+use nix::errno::Errno;
 use rtnetlink::{Handle, RouteMessageBuilder, RouteNextHopBuilder};
-use libc;
 
 /// Protocol ID for BGP routes (186 = BGP per IANA)
 const RTPROT_BGP: RouteProtocol = RouteProtocol::Other(186);
@@ -224,7 +224,7 @@ impl NetlinkHandle {
         // Try to delete - ignore error if route doesn't exist
         match self.handle.route().del(message).execute().await {
             Ok(_) => Ok(()),
-            Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -libc::ESRCH => {
+            Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -(Errno::ESRCH as i32) => {
                 // Route not found - that's fine
                 Ok(())
             }
@@ -247,7 +247,7 @@ impl NetlinkHandle {
         // Try to delete - ignore error if route doesn't exist
         match self.handle.route().del(message).execute().await {
             Ok(_) => Ok(()),
-            Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -libc::ESRCH => {
+            Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -(Errno::ESRCH as i32) => {
                 // Route not found - that's fine
                 Ok(())
             }
