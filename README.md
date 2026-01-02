@@ -59,6 +59,10 @@ prefixes = ["2001:db8::/32"]
 hold_time = 9           # default: 9s (keepalive = 3s)
 connect_retry_time = 30 # default: 30s
 
+# Optional: address families
+ipv4_unicast = false    # default: false
+ipv6_unicast = true     # default: true
+
 # BGP unnumbered - just specify the interface
 [[peer]]
 interface = "eth0"

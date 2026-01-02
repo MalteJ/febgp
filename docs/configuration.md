@@ -35,6 +35,8 @@ address = "fe80::1"
 | `hold_time` | integer | no | `9` | BGP hold time in seconds (keepalive = hold_time / 3) |
 | `connect_retry_time` | integer | no | `30` | Connect retry timer in seconds |
 | `install_routes` | boolean | no | `false` | Install received routes into Linux routing table via netlink |
+| `ipv4_unicast` | boolean | no | `false` | Enable IPv4 unicast address family |
+| `ipv6_unicast` | boolean | no | `true` | Enable IPv6 unicast address family |
 
 ## Peer Configuration
 
