@@ -2,6 +2,9 @@
 //!
 //! Handles running individual BGP peer sessions and managing their state.
 
+pub mod startup;
+
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,8 +17,9 @@ use crate::bgp::{
     build_ipv4_update, build_ipv6_update, parse_update, FsmConfig, FsmState, SessionActor,
     SessionCommand, SessionEvent, TcpTransport,
 };
-use crate::config::{parse_peer_address, PeerConfig};
+use crate::config::{Config, parse_peer_address, PeerConfig};
 use crate::neighbor_discovery::get_interface_link_local;
+use crate::peer_manager::PeerManagerHandle;
 use crate::rib::{RibHandle, RouteEvent, LOCAL_PEER_IDX};
 
 /// Context for running a peer session.
@@ -32,6 +36,41 @@ pub struct PeerSessionContext {
     pub ipv4_unicast: bool,
     pub ipv6_unicast: bool,
     pub shutdown_rx: watch::Receiver<bool>,
+}
+
+/// Shared daemon context bundling handles for task spawning.
+///
+/// This struct bundles all the shared handles needed by various daemon tasks,
+/// eliminating the need to clone many individual Arc values when spawning tasks.
+#[derive(Clone)]
+pub struct DaemonContext {
+    pub state: Arc<RwLock<DaemonState>>,
+    pub rib_handle: RibHandle,
+    pub session_senders: Arc<RwLock<Vec<mpsc::Sender<SessionCommand>>>>,
+    pub peer_addr_to_sender: Arc<RwLock<HashMap<String, mpsc::Sender<SessionCommand>>>>,
+    pub peer_manager_handle: PeerManagerHandle,
+    pub config: Arc<Config>,
+    pub shutdown_rx: watch::Receiver<bool>,
+}
+
+impl DaemonContext {
+    /// Create a new peer session context from this daemon context.
+    pub fn peer_session_context(&self, peer_idx: usize, peer: PeerConfig) -> PeerSessionContext {
+        PeerSessionContext {
+            peer_idx,
+            peer,
+            local_asn: self.config.asn,
+            router_id: self.config.router_id,
+            state: Arc::clone(&self.state),
+            prefixes: self.config.prefixes.clone(),
+            rib_handle: self.rib_handle.clone(),
+            hold_time: self.config.hold_time,
+            connect_retry_time: self.config.connect_retry_time,
+            ipv4_unicast: self.config.ipv4_unicast,
+            ipv6_unicast: self.config.ipv6_unicast,
+            shutdown_rx: self.shutdown_rx.clone(),
+        }
+    }
 }
 
 /// Run a BGP session for a single peer.

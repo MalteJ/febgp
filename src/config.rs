@@ -4,6 +4,11 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
+/// Default BGP hold time in seconds (keepalive = hold_time / 3).
+pub const DEFAULT_HOLD_TIME: u16 = 9;
+/// Default connect retry timer in seconds.
+pub const DEFAULT_CONNECT_RETRY_TIME: u64 = 30;
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub asn: u32,
@@ -39,11 +44,27 @@ fn default_true() -> bool {
 }
 
 fn default_hold_time() -> u16 {
-    9
+    DEFAULT_HOLD_TIME
 }
 
 fn default_connect_retry_time() -> u64 {
-    30
+    DEFAULT_CONNECT_RETRY_TIME
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            asn: 0,
+            router_id: Ipv4Addr::new(0, 0, 0, 0),
+            prefixes: Vec::new(),
+            peers: Vec::new(),
+            hold_time: DEFAULT_HOLD_TIME,
+            connect_retry_time: DEFAULT_CONNECT_RETRY_TIME,
+            ipv4_unicast: false,
+            ipv6_unicast: true,
+            install_routes: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

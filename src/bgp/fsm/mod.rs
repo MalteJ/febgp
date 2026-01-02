@@ -89,36 +89,56 @@ impl Fsm {
         }
     }
 
-    /// Get the current state.
     pub fn state(&self) -> FsmState {
         self.state
     }
 
-    /// Get the configuration.
     pub fn config(&self) -> &FsmConfig {
         &self.config
     }
 
-    /// Get the negotiated hold time.
     pub fn negotiated_hold_time(&self) -> Option<Duration> {
         self.negotiated_hold_time
     }
 
-    /// Get the peer's router ID.
     pub fn peer_router_id(&self) -> Option<Ipv4Addr> {
         self.peer_router_id
     }
 
-    /// Get the peer's ASN.
     pub fn peer_asn(&self) -> Option<u32> {
         self.peer_asn
     }
 
-    /// Get the connect retry counter.
-    /// Utility method for monitoring connection attempts.
     #[allow(dead_code)]
     pub fn connect_retry_counter(&self) -> u32 {
         self.connect_retry_counter
+    }
+
+    // ==================== Action Helpers ====================
+
+    /// Generate error response actions: send notification, cleanup, increment counter.
+    fn actions_error(&self, err: NotificationError) -> Vec<FsmAction> {
+        vec![
+            FsmAction::SendNotification(err),
+            FsmAction::DropTcpConnection,
+            FsmAction::ReleaseResources,
+            FsmAction::IncrementConnectRetryCounter,
+        ]
+    }
+
+    /// Generate cleanup actions when notification is received.
+    fn actions_on_notification(&self) -> Vec<FsmAction> {
+        vec![FsmAction::DropTcpConnection, FsmAction::ReleaseResources]
+    }
+
+    /// Generate hold timer expiration actions.
+    fn actions_hold_timer_expired(&self) -> Vec<FsmAction> {
+        self.actions_error(NotificationError::hold_timer_expired())
+    }
+
+    /// Generate keepalive timer actions.
+    fn actions_keepalive_timer() -> Vec<FsmAction> {
+        vec![FsmAction::SendKeepalive, FsmAction::ResetKeepaliveTimer]
     }
 
     /// Process an event and return the actions to take.
@@ -215,17 +235,12 @@ impl Fsm {
             FsmEvent::Message(MessageEvent::BgpHeaderErr(err) | MessageEvent::BgpOpenMsgErr(err)) => {
                 self.state = FsmState::Idle;
                 self.connect_retry_counter += 1;
-                vec![
-                    FsmAction::SendNotification(err),
-                    FsmAction::DropTcpConnection,
-                    FsmAction::ReleaseResources,
-                    FsmAction::IncrementConnectRetryCounter,
-                ]
+                self.actions_error(err)
             }
 
             FsmEvent::Message(MessageEvent::NotifMsg { .. }) => {
                 self.state = FsmState::Idle;
-                vec![FsmAction::DropTcpConnection, FsmAction::ReleaseResources]
+                self.actions_on_notification()
             }
 
             _ => vec![],
@@ -274,17 +289,12 @@ impl Fsm {
             FsmEvent::Message(MessageEvent::BgpHeaderErr(err) | MessageEvent::BgpOpenMsgErr(err)) => {
                 self.state = FsmState::Idle;
                 self.connect_retry_counter += 1;
-                vec![
-                    FsmAction::SendNotification(err),
-                    FsmAction::DropTcpConnection,
-                    FsmAction::ReleaseResources,
-                    FsmAction::IncrementConnectRetryCounter,
-                ]
+                self.actions_error(err)
             }
 
             FsmEvent::Message(MessageEvent::NotifMsg { .. }) => {
                 self.state = FsmState::Idle;
-                vec![FsmAction::DropTcpConnection, FsmAction::ReleaseResources]
+                self.actions_on_notification()
             }
 
             _ => vec![],
@@ -308,12 +318,7 @@ impl Fsm {
             FsmEvent::Timer(TimerEvent::HoldTimerExpires) => {
                 self.state = FsmState::Idle;
                 self.connect_retry_counter += 1;
-                vec![
-                    FsmAction::SendNotification(NotificationError::hold_timer_expired()),
-                    FsmAction::DropTcpConnection,
-                    FsmAction::ReleaseResources,
-                    FsmAction::IncrementConnectRetryCounter,
-                ]
+                self.actions_hold_timer_expired()
             }
 
             FsmEvent::Tcp(TcpEvent::TcpConnectionFails) => {
@@ -331,31 +336,21 @@ impl Fsm {
             FsmEvent::Message(MessageEvent::BgpHeaderErr(err)) => {
                 self.state = FsmState::Idle;
                 self.connect_retry_counter += 1;
-                vec![
-                    FsmAction::SendNotification(err),
-                    FsmAction::DropTcpConnection,
-                    FsmAction::ReleaseResources,
-                    FsmAction::IncrementConnectRetryCounter,
-                ]
+                self.actions_error(err)
             }
 
             FsmEvent::Message(MessageEvent::NotifMsg { .. }) => {
                 self.state = FsmState::Idle;
-                vec![FsmAction::DropTcpConnection, FsmAction::ReleaseResources]
+                self.actions_on_notification()
             }
 
             // Unexpected messages in OpenSent
             FsmEvent::Message(MessageEvent::KeepAliveMsg | MessageEvent::UpdateMsg(_)) => {
                 self.state = FsmState::Idle;
                 self.connect_retry_counter += 1;
-                vec![
-                    FsmAction::SendNotification(NotificationError::fsm_error(
-                        FsmErrorSubcode::UnexpectedMessageInOpenSentState,
-                    )),
-                    FsmAction::DropTcpConnection,
-                    FsmAction::ReleaseResources,
-                    FsmAction::IncrementConnectRetryCounter,
-                ]
+                self.actions_error(NotificationError::fsm_error(
+                    FsmErrorSubcode::UnexpectedMessageInOpenSentState,
+                ))
             }
 
             _ => vec![],
@@ -372,12 +367,7 @@ impl Fsm {
         if let Err(err) = validate_open(&open, &validation_config) {
             self.state = FsmState::Idle;
             self.connect_retry_counter += 1;
-            return vec![
-                FsmAction::SendNotification(err),
-                FsmAction::DropTcpConnection,
-                FsmAction::ReleaseResources,
-                FsmAction::IncrementConnectRetryCounter,
-            ];
+            return self.actions_error(err);
         }
 
         // OPEN is valid - negotiate hold time and transition to OpenConfirm
@@ -419,17 +409,12 @@ impl Fsm {
             FsmEvent::Timer(TimerEvent::HoldTimerExpires) => {
                 self.state = FsmState::Idle;
                 self.connect_retry_counter += 1;
-                vec![
-                    FsmAction::SendNotification(NotificationError::hold_timer_expired()),
-                    FsmAction::DropTcpConnection,
-                    FsmAction::ReleaseResources,
-                    FsmAction::IncrementConnectRetryCounter,
-                ]
+                self.actions_hold_timer_expired()
             }
 
             FsmEvent::Timer(TimerEvent::KeepaliveTimerExpires) => {
                 // Stay in OpenConfirm, send keepalive
-                vec![FsmAction::SendKeepalive, FsmAction::ResetKeepaliveTimer]
+                Self::actions_keepalive_timer()
             }
 
             FsmEvent::Tcp(TcpEvent::TcpConnectionFails) => {
@@ -443,7 +428,7 @@ impl Fsm {
 
             FsmEvent::Message(MessageEvent::NotifMsg { .. }) => {
                 self.state = FsmState::Idle;
-                vec![FsmAction::DropTcpConnection, FsmAction::ReleaseResources]
+                self.actions_on_notification()
             }
 
             FsmEvent::Message(MessageEvent::KeepAliveMsg) => {
@@ -455,26 +440,16 @@ impl Fsm {
             FsmEvent::Message(MessageEvent::BgpHeaderErr(err) | MessageEvent::BgpOpenMsgErr(err)) => {
                 self.state = FsmState::Idle;
                 self.connect_retry_counter += 1;
-                vec![
-                    FsmAction::SendNotification(err),
-                    FsmAction::DropTcpConnection,
-                    FsmAction::ReleaseResources,
-                    FsmAction::IncrementConnectRetryCounter,
-                ]
+                self.actions_error(err)
             }
 
             // Unexpected messages in OpenConfirm
             FsmEvent::Message(MessageEvent::BgpOpen(_) | MessageEvent::UpdateMsg(_)) => {
                 self.state = FsmState::Idle;
                 self.connect_retry_counter += 1;
-                vec![
-                    FsmAction::SendNotification(NotificationError::fsm_error(
-                        FsmErrorSubcode::UnexpectedMessageInOpenConfirmState,
-                    )),
-                    FsmAction::DropTcpConnection,
-                    FsmAction::ReleaseResources,
-                    FsmAction::IncrementConnectRetryCounter,
-                ]
+                self.actions_error(NotificationError::fsm_error(
+                    FsmErrorSubcode::UnexpectedMessageInOpenConfirmState,
+                ))
             }
 
             _ => vec![],
@@ -498,17 +473,12 @@ impl Fsm {
             FsmEvent::Timer(TimerEvent::HoldTimerExpires) => {
                 self.state = FsmState::Idle;
                 self.connect_retry_counter += 1;
-                vec![
-                    FsmAction::SendNotification(NotificationError::hold_timer_expired()),
-                    FsmAction::DropTcpConnection,
-                    FsmAction::ReleaseResources,
-                    FsmAction::IncrementConnectRetryCounter,
-                ]
+                self.actions_hold_timer_expired()
             }
 
             FsmEvent::Timer(TimerEvent::KeepaliveTimerExpires) => {
                 // Stay in Established, send keepalive
-                vec![FsmAction::SendKeepalive, FsmAction::ResetKeepaliveTimer]
+                Self::actions_keepalive_timer()
             }
 
             FsmEvent::Tcp(TcpEvent::TcpConnectionFails) => {
@@ -518,7 +488,7 @@ impl Fsm {
 
             FsmEvent::Message(MessageEvent::NotifMsg { .. }) => {
                 self.state = FsmState::Idle;
-                vec![FsmAction::DropTcpConnection, FsmAction::ReleaseResources]
+                self.actions_on_notification()
             }
 
             FsmEvent::Message(MessageEvent::KeepAliveMsg) => {
