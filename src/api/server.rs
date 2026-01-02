@@ -14,7 +14,7 @@ use super::FebgpService;
 use crate::bgp::SessionState;
 use crate::config::PeerConfig;
 use crate::peer_manager::PeerManagerHandle;
-use crate::rib::{ApiRoute, RibHandle, RouteEvent};
+use crate::rib::{ApiRouteInput, RibHandle, RouteEvent};
 
 /// Shared daemon state accessible by gRPC handlers
 pub struct DaemonState {
@@ -209,7 +209,7 @@ impl FebgpService for FebgpServiceImpl {
             state.rib_handle.clone()
         };
 
-        let route = ApiRoute {
+        let route = ApiRouteInput {
             prefix: req.prefix,
             next_hop: if req.next_hop.is_empty() { None } else { Some(req.next_hop) },
             as_path: req.as_path,

@@ -6,6 +6,7 @@
 //! - Kernel route installation via netlink
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use ipnet::IpNet;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -34,39 +35,39 @@ pub enum RouteEvent {
     BestChanged(RouteEntry),
 }
 
-/// A locally originated route added via API.
+/// Input for adding a locally originated route via API.
+/// Validated and converted to RouteEntry for storage.
 #[derive(Debug, Clone)]
-pub struct ApiRoute {
+pub struct ApiRouteInput {
     pub prefix: String,
     pub next_hop: Option<String>,
     pub as_path: Vec<u32>,
 }
 
-/// Events for API route changes that need to be advertised to peers.
-#[derive(Debug, Clone)]
-pub enum ApiRouteAdvertisement {
-    /// Announce a new route to all peers.
-    Announce(ApiRoute),
-    /// Withdraw a route from all peers.
-    Withdraw { prefix: String },
-}
-
 /// Next-hop information including interface for link-local addresses.
+///
+/// Uses `Arc<str>` for interface to make cloning cheap (reference count increment).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NextHop {
     pub addr: IpAddr,
-    pub interface: Option<String>,
+    /// Interface name for link-local addresses (cheap to clone).
+    pub interface: Option<Arc<str>>,
 }
 
 impl NextHop {
     /// Create a new NextHop, adding interface suffix for link-local addresses.
     pub fn new(addr: IpAddr, interface: &str) -> Self {
         let interface = if is_link_local(&addr) {
-            Some(interface.to_string())
+            Some(Arc::from(interface))
         } else {
             None
         };
         Self { addr, interface }
+    }
+
+    /// Create a NextHop without interface (for API routes with global addresses).
+    pub fn global(addr: IpAddr) -> Self {
+        Self { addr, interface: None }
     }
 
     /// Format as string with interface suffix if needed (e.g., "fe80::1%eth0").
@@ -134,7 +135,7 @@ pub enum RibCommand {
     },
     /// Add a locally originated route (via API).
     AddApiRoute {
-        route: ApiRoute,
+        route: ApiRouteInput,
         response: oneshot::Sender<Result<(), RibError>>,
     },
     /// Withdraw a locally originated route (via API).
@@ -144,15 +145,15 @@ pub enum RibCommand {
     },
     /// Get all locally originated routes (for advertising to new peers).
     GetApiRoutes {
-        response: oneshot::Sender<Vec<ApiRoute>>,
+        response: oneshot::Sender<Vec<RouteEntry>>,
     },
 }
 
 /// The Routing Information Base.
 pub struct Rib {
     routes: Vec<RouteEntry>,
-    /// Locally originated routes (added via API).
-    api_routes: Vec<ApiRoute>,
+    /// Locally originated routes (added via API), stored as RouteEntry with peer_idx = LOCAL_PEER_IDX.
+    api_routes: Vec<RouteEntry>,
     /// Reusable netlink handle for route installation (None if route installation disabled)
     netlink: Option<NetlinkHandle>,
 }
@@ -194,29 +195,51 @@ impl Rib {
     }
 
     /// Get all API routes.
-    pub fn api_routes(&self) -> &[ApiRoute] {
+    pub fn api_routes(&self) -> &[RouteEntry] {
         &self.api_routes
     }
 
     /// Add a locally originated route.
-    pub fn add_api_route(&mut self, route: ApiRoute) -> Result<(), RibError> {
+    /// Validates input and converts to RouteEntry for storage.
+    pub fn add_api_route(&mut self, input: ApiRouteInput) -> Result<RouteEntry, RibError> {
+        // Parse and validate prefix
+        let prefix: IpNet = input
+            .prefix
+            .parse()
+            .map_err(|_| RibError::InvalidPrefix(input.prefix.clone()))?;
+
         // Check if route already exists
-        if self.api_routes.iter().any(|r| r.prefix == route.prefix) {
-            return Err(RibError::DuplicateRoute(route.prefix));
+        if self.api_routes.iter().any(|r| r.prefix == prefix) {
+            return Err(RibError::DuplicateRoute(input.prefix));
         }
 
-        // Validate prefix format
-        if !is_valid_prefix(&route.prefix) {
-            return Err(RibError::InvalidPrefix(route.prefix));
-        }
+        // Parse next_hop if provided
+        let next_hop_addr = input
+            .next_hop
+            .as_ref()
+            .and_then(|s| s.parse::<IpAddr>().ok())
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
-        self.api_routes.push(route);
-        Ok(())
+        let entry = RouteEntry {
+            prefix,
+            next_hop: NextHop::global(next_hop_addr),
+            as_path: input.as_path,
+            origin: Origin::Igp,
+            peer_idx: LOCAL_PEER_IDX,
+            best: true,
+        };
+
+        self.api_routes.push(entry.clone());
+        Ok(entry)
     }
 
     /// Withdraw a locally originated route.
-    pub fn withdraw_api_route(&mut self, prefix: &str) -> Result<ApiRoute, RibError> {
-        let idx = self.api_routes.iter().position(|r| r.prefix == prefix);
+    pub fn withdraw_api_route(&mut self, prefix: &str) -> Result<RouteEntry, RibError> {
+        let prefix_net: IpNet = prefix
+            .parse()
+            .map_err(|_| RibError::InvalidPrefix(prefix.to_string()))?;
+
+        let idx = self.api_routes.iter().position(|r| r.prefix == prefix_net);
         match idx {
             Some(i) => Ok(self.api_routes.remove(i)),
             None => Err(RibError::RouteNotFound(prefix.to_string())),
@@ -403,11 +426,6 @@ impl Rib {
     }
 }
 
-/// Validate prefix format (basic CIDR validation).
-fn is_valid_prefix(prefix: &str) -> bool {
-    prefix.parse::<IpNet>().is_ok()
-}
-
 /// Recalculate best paths for a given prefix.
 /// Shorter AS path wins. Equal AS path length = ECMP (all marked as best).
 fn recalculate_best_paths(routes: &mut [RouteEntry], prefix: &IpNet) {
@@ -550,47 +568,32 @@ impl RibActor {
                 }
                 RibCommand::AddApiRoute { route, response } => {
                     let prefix_str = route.prefix.clone();
-                    let result = self.rib.add_api_route(route.clone());
-                    if result.is_ok() {
-                        // Create a RouteEntry for the API route (for event emission)
-                        if let Ok(prefix) = prefix_str.parse::<IpNet>() {
-                            let next_hop_addr = route
-                                .next_hop
-                                .as_ref()
-                                .and_then(|s| s.parse::<IpAddr>().ok())
-                                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                            let entry = RouteEntry {
-                                prefix,
-                                next_hop: NextHop { addr: next_hop_addr, interface: None },
-                                as_path: route.as_path.clone(),
-                                origin: Origin::Igp,
-                                peer_idx: LOCAL_PEER_IDX,
-                                best: true,
-                            };
+                    match self.rib.add_api_route(route) {
+                        Ok(entry) => {
                             let _ = self.event_tx.send(RouteEvent::Added(entry));
+                            tracing::info!(prefix = %prefix_str, "Added API route");
+                            let _ = response.send(Ok(()));
                         }
-                        tracing::info!(prefix = %prefix_str, "Added API route");
+                        Err(e) => {
+                            let _ = response.send(Err(e));
+                        }
                     }
-                    let _ = response.send(result);
                 }
                 RibCommand::WithdrawApiRoute { prefix, response } => {
-                    let result = self.rib.withdraw_api_route(&prefix);
-                    if let Ok(route) = &result {
-                        if let Ok(prefix_net) = route.prefix.parse::<IpNet>() {
-                            let next_hop_addr = route
-                                .next_hop
-                                .as_ref()
-                                .and_then(|s| s.parse::<IpAddr>().ok())
-                                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                    match self.rib.withdraw_api_route(&prefix) {
+                        Ok(entry) => {
                             let _ = self.event_tx.send(RouteEvent::Withdrawn {
-                                prefix: prefix_net,
-                                next_hop: NextHop { addr: next_hop_addr, interface: None },
+                                prefix: entry.prefix,
+                                next_hop: entry.next_hop,
                                 peer_idx: LOCAL_PEER_IDX,
                             });
+                            tracing::info!(prefix = %prefix, "Withdrawn API route");
+                            let _ = response.send(Ok(()));
                         }
-                        tracing::info!(prefix = %route.prefix, "Withdrawn API route");
+                        Err(e) => {
+                            let _ = response.send(Err(e));
+                        }
                     }
-                    let _ = response.send(result.map(|_| ()));
                 }
                 RibCommand::GetApiRoutes { response } => {
                     let routes = self.rib.api_routes().to_vec();
@@ -717,7 +720,7 @@ impl RibHandle {
     }
 
     /// Add a locally originated route (via API).
-    pub async fn add_api_route(&self, route: ApiRoute) -> Result<(), RibError> {
+    pub async fn add_api_route(&self, route: ApiRouteInput) -> Result<(), RibError> {
         let (tx, rx) = oneshot::channel();
         if self
             .sender
@@ -749,7 +752,7 @@ impl RibHandle {
     }
 
     /// Get all locally originated routes.
-    pub async fn get_api_routes(&self) -> Vec<ApiRoute> {
+    pub async fn get_api_routes(&self) -> Vec<RouteEntry> {
         let (tx, rx) = oneshot::channel();
         if self
             .sender
@@ -835,7 +838,7 @@ mod tests {
     fn test_next_hop_link_local() {
         let nh = NextHop::new("fe80::1".parse().unwrap(), "eth0");
         assert_eq!(nh.to_string_with_interface(), "fe80::1%eth0");
-        assert_eq!(nh.interface, Some("eth0".to_string()));
+        assert_eq!(nh.interface.as_deref(), Some("eth0"));
     }
 
     #[test]
@@ -985,35 +988,13 @@ mod tests {
         assert_eq!(rib.routes()[0].peer_idx, 1);
     }
 
-    // Tests for new API route functionality
-
-    #[test]
-    fn test_is_valid_prefix_ipv4() {
-        assert!(is_valid_prefix("10.0.0.0/24"));
-        assert!(is_valid_prefix("192.168.1.0/32"));
-        assert!(is_valid_prefix("0.0.0.0/0"));
-    }
-
-    #[test]
-    fn test_is_valid_prefix_ipv6() {
-        assert!(is_valid_prefix("2001:db8::/32"));
-        assert!(is_valid_prefix("fe80::1/128"));
-        assert!(is_valid_prefix("::/0"));
-    }
-
-    #[test]
-    fn test_is_valid_prefix_invalid() {
-        assert!(!is_valid_prefix("10.0.0.0")); // Missing prefix length
-        assert!(!is_valid_prefix("invalid/24")); // Invalid IP
-        assert!(!is_valid_prefix("10.0.0.0/abc")); // Invalid prefix length
-        assert!(!is_valid_prefix("")); // Empty string
-    }
+    // Tests for API route functionality
 
     #[test]
     fn test_api_route_add() {
         let mut rib = Rib::new();
 
-        let route = ApiRoute {
+        let route = ApiRouteInput {
             prefix: "10.0.0.0/24".to_string(),
             next_hop: Some("192.168.1.1".to_string()),
             as_path: vec![65001],
@@ -1022,20 +1003,20 @@ mod tests {
         let result = rib.add_api_route(route);
         assert!(result.is_ok());
         assert_eq!(rib.api_routes().len(), 1);
-        assert_eq!(rib.api_routes()[0].prefix, "10.0.0.0/24");
+        assert_eq!(rib.api_routes()[0].prefix, prefix("10.0.0.0/24"));
     }
 
     #[test]
     fn test_api_route_add_duplicate() {
         let mut rib = Rib::new();
 
-        let route1 = ApiRoute {
+        let route1 = ApiRouteInput {
             prefix: "10.0.0.0/24".to_string(),
             next_hop: None,
             as_path: vec![],
         };
 
-        let route2 = ApiRoute {
+        let route2 = ApiRouteInput {
             prefix: "10.0.0.0/24".to_string(),
             next_hop: Some("192.168.1.1".to_string()),
             as_path: vec![65001],
@@ -1050,7 +1031,7 @@ mod tests {
     fn test_api_route_add_invalid_prefix() {
         let mut rib = Rib::new();
 
-        let route = ApiRoute {
+        let route = ApiRouteInput {
             prefix: "invalid".to_string(),
             next_hop: None,
             as_path: vec![],
@@ -1064,7 +1045,7 @@ mod tests {
     fn test_api_route_withdraw() {
         let mut rib = Rib::new();
 
-        let route = ApiRoute {
+        let route = ApiRouteInput {
             prefix: "10.0.0.0/24".to_string(),
             next_hop: None,
             as_path: vec![],
@@ -1140,7 +1121,7 @@ mod tests {
         let handle = RibHandle::new(tx, event_tx);
 
         // Add an API route
-        let route = ApiRoute {
+        let route = ApiRouteInput {
             prefix: "10.0.0.0/24".to_string(),
             next_hop: Some("192.168.1.1".to_string()),
             as_path: vec![65001],
@@ -1183,7 +1164,7 @@ mod tests {
         let handle = RibHandle::new(tx, event_tx);
 
         // Add an API route first
-        let route = ApiRoute {
+        let route = ApiRouteInput {
             prefix: "10.0.0.0/24".to_string(),
             next_hop: None,
             as_path: vec![],
@@ -1225,13 +1206,13 @@ mod tests {
         let handle = RibHandle::new(tx, event_tx);
 
         // Add some API routes
-        handle.add_api_route(ApiRoute {
+        handle.add_api_route(ApiRouteInput {
             prefix: "10.0.0.0/24".to_string(),
             next_hop: None,
             as_path: vec![],
         }).await.unwrap();
 
-        handle.add_api_route(ApiRoute {
+        handle.add_api_route(ApiRouteInput {
             prefix: "192.168.0.0/16".to_string(),
             next_hop: Some("10.0.0.1".to_string()),
             as_path: vec![65001, 65002],
@@ -1241,9 +1222,9 @@ mod tests {
         let routes = handle.get_api_routes().await;
         assert_eq!(routes.len(), 2);
 
-        let prefixes: Vec<_> = routes.iter().map(|r| r.prefix.as_str()).collect();
-        assert!(prefixes.contains(&"10.0.0.0/24"));
-        assert!(prefixes.contains(&"192.168.0.0/16"));
+        let prefixes: Vec<_> = routes.iter().map(|r| r.prefix.to_string()).collect();
+        assert!(prefixes.iter().any(|p| p == "10.0.0.0/24"));
+        assert!(prefixes.iter().any(|p| p == "192.168.0.0/16"));
     }
 
     #[tokio::test]

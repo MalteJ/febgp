@@ -296,19 +296,20 @@ pub async fn run_peer_session(
                         // Also announce any existing API routes
                         let api_routes = rib_handle.get_api_routes().await;
                         for route in api_routes {
-                            if let Some(body) = announce_prefix(&route.prefix, local_asn, local_link_local) {
+                            let prefix_str = route.prefix.to_string();
+                            if let Some(body) = announce_prefix(&prefix_str, local_asn, local_link_local) {
                                 if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(body)).await {
                                     error!(
-                                        prefix = %route.prefix,
+                                        prefix = %prefix_str,
                                         peer = %peer_addr_display,
                                         error = %e,
                                         "Failed to send API route UPDATE: {}", e
                                     );
                                 } else {
                                     debug!(
-                                        prefix = %route.prefix,
+                                        prefix = %prefix_str,
                                         peer = %peer_addr_display,
-                                        "Announced API route {} to {}", route.prefix, peer_addr_display
+                                        "Announced API route {} to {}", prefix_str, peer_addr_display
                                     );
                                 }
                             }
