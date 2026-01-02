@@ -182,7 +182,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(transport.sent_count(), 1);
-        assert_eq!(transport.take_sent(), Some(bytes));
+        assert_eq!(transport.take_sent(), Some(bytes.to_vec()));
     }
 
     #[tokio::test]

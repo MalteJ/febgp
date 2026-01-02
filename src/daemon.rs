@@ -131,7 +131,7 @@ pub async fn run_peer_session(
 
     // Helper to announce a prefix to this peer
     let announce_prefix =
-        |prefix: &str, local_asn: u32, local_link_local: std::net::Ipv6Addr| -> Option<Vec<u8>> {
+        |prefix: &str, local_asn: u32, local_link_local: std::net::Ipv6Addr| -> Option<bytes::Bytes> {
             if prefix.contains(':') {
                 build_ipv6_update(prefix, local_asn, local_link_local)
             } else {

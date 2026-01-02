@@ -357,7 +357,7 @@ async fn main() -> ExitCode {
 
         for prefix in &args.announce_v4 {
             if let Some(update) = build_ipv4_update(prefix, args.local_asn, next_hop) {
-                if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(update)).await {
+                if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(update.into())).await {
                     eprintln!("Failed to send IPv4 UPDATE: {}", e);
                 }
                 println!("SENT_UPDATE_V4: {}", prefix);
@@ -365,7 +365,7 @@ async fn main() -> ExitCode {
         }
         for prefix in &args.announce_v6 {
             if let Some(update) = build_ipv6_update(prefix, args.local_asn, next_hop) {
-                if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(update)).await {
+                if let Err(e) = cmd_tx.send(SessionCommand::SendUpdate(update.into())).await {
                     eprintln!("Failed to send IPv6 UPDATE: {}", e);
                 }
                 println!("SENT_UPDATE_V6: {}", prefix);

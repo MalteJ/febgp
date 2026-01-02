@@ -1,5 +1,6 @@
 use super::error::NotificationError;
 use super::state::FsmState;
+use bytes::Bytes;
 use std::time::Duration;
 
 /// Actions the FSM requests the session actor to perform.
@@ -61,7 +62,7 @@ pub enum FsmAction {
     ReleaseResources,
 
     /// Process a received UPDATE message (for RIB).
-    ProcessUpdate(Vec<u8>),
+    ProcessUpdate(Bytes),
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use super::error::NotificationError;
+use bytes::Bytes;
 use crate::bgp::message::OpenMessage;
 
 /// Administrative events from operator or configuration.
@@ -97,7 +98,7 @@ pub enum MessageEvent {
     /// Event 26: KEEPALIVE message received.
     KeepAliveMsg,
     /// Event 27: Valid UPDATE message received.
-    UpdateMsg(Vec<u8>),
+    UpdateMsg(Bytes),
     /// Event 28: UPDATE message error detected.
     UpdateMsgErr(NotificationError),
 }

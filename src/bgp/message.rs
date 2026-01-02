@@ -1,6 +1,8 @@
 use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
 pub const BGP_MARKER: [u8; 16] = [0xFF; 16];
 pub const BGP_VERSION: u8 = 4;
 pub const BGP_HEADER_LEN: usize = 19;
@@ -92,40 +94,42 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(8);
         match self {
             Capability::MultiProtocol { afi, safi } => {
-                let mut buf = vec![1, 4]; // Type 1, Length 4
-                buf.extend_from_slice(&afi.to_be_bytes());
-                buf.push(0); // Reserved
-                buf.push(*safi);
-                buf
+                buf.put_u8(1); // Type 1
+                buf.put_u8(4); // Length 4
+                buf.put_u16(*afi);
+                buf.put_u8(0); // Reserved
+                buf.put_u8(*safi);
             }
             Capability::FourOctetAs { asn } => {
-                let mut buf = vec![65, 4]; // Type 65, Length 4
-                buf.extend_from_slice(&asn.to_be_bytes());
-                buf
+                buf.put_u8(65); // Type 65
+                buf.put_u8(4); // Length 4
+                buf.put_u32(*asn);
             }
             Capability::Unknown { code, data } => {
-                let mut buf = vec![*code, data.len() as u8];
-                buf.extend_from_slice(data);
-                buf
+                buf.put_u8(*code);
+                buf.put_u8(data.len() as u8);
+                buf.put_slice(data);
             }
         }
+        buf.freeze()
     }
 
-    pub fn decode(data: &[u8]) -> io::Result<(Self, usize)> {
-        if data.len() < 2 {
+    pub fn decode(data: &mut impl Buf) -> io::Result<Self> {
+        if data.remaining() < 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Capability too short",
             ));
         }
 
-        let cap_type = data[0];
-        let cap_len = data[1] as usize;
+        let cap_type = data.get_u8();
+        let cap_len = data.get_u8() as usize;
 
-        if data.len() < 2 + cap_len {
+        if data.remaining() < cap_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Capability data too short",
@@ -141,8 +145,9 @@ impl Capability {
                         "Invalid multiprotocol capability length",
                     ));
                 }
-                let afi = u16::from_be_bytes([data[2], data[3]]);
-                let safi = data[5];
+                let afi = data.get_u16();
+                let _reserved = data.get_u8();
+                let safi = data.get_u8();
                 Capability::MultiProtocol { afi, safi }
             }
             65 => {
@@ -153,17 +158,18 @@ impl Capability {
                         "Invalid 4-octet AS capability length",
                     ));
                 }
-                let asn = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+                let asn = data.get_u32();
                 Capability::FourOctetAs { asn }
             }
             _ => {
                 // Unknown capability, preserve it
-                let cap_data = data[2..2 + cap_len].to_vec();
+                let mut cap_data = vec![0u8; cap_len];
+                data.copy_to_slice(&mut cap_data);
                 Capability::Unknown { code: cap_type, data: cap_data }
             }
         };
 
-        Ok((cap, 2 + cap_len))
+        Ok(cap)
     }
 }
 
@@ -203,75 +209,74 @@ impl OpenMessage {
         Self::new_with_families(asn, hold_time, router_id, false, true)
     }
 
-    pub fn encode(&self) -> Vec<u8> {
-        let mut opt_params = Vec::new();
+    pub fn encode(&self) -> Bytes {
+        let mut opt_params = BytesMut::new();
 
         // Encode capabilities as optional parameter type 2
-        let mut cap_data = Vec::new();
+        let mut cap_data = BytesMut::new();
         for cap in &self.capabilities {
-            cap_data.extend(cap.encode());
+            cap_data.put(cap.encode());
         }
 
         if !cap_data.is_empty() {
-            opt_params.push(2); // Parameter type: Capabilities
-            opt_params.push(cap_data.len() as u8);
-            opt_params.extend(cap_data);
+            opt_params.put_u8(2); // Parameter type: Capabilities
+            opt_params.put_u8(cap_data.len() as u8);
+            opt_params.put(cap_data);
         }
 
-        let mut msg = Vec::new();
-        msg.push(self.version);
-        msg.extend_from_slice(&self.asn.to_be_bytes());
-        msg.extend_from_slice(&self.hold_time.to_be_bytes());
-        msg.extend_from_slice(&self.router_id.octets());
-        msg.push(opt_params.len() as u8);
-        msg.extend(opt_params);
+        let mut msg = BytesMut::with_capacity(10 + opt_params.len());
+        msg.put_u8(self.version);
+        msg.put_u16(self.asn);
+        msg.put_u16(self.hold_time);
+        msg.put_slice(&self.router_id.octets());
+        msg.put_u8(opt_params.len() as u8);
+        msg.put(opt_params);
 
-        msg
+        msg.freeze()
     }
 
-    pub fn decode(data: &[u8]) -> io::Result<Self> {
-        if data.len() < 10 {
+    pub fn decode(data: &mut impl Buf) -> io::Result<Self> {
+        if data.remaining() < 10 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "OPEN message too short",
             ));
         }
 
-        let version = data[0];
-        let asn = u16::from_be_bytes([data[1], data[2]]);
-        let hold_time = u16::from_be_bytes([data[3], data[4]]);
-        let router_id = Ipv4Addr::new(data[5], data[6], data[7], data[8]);
-        let opt_param_len = data[9] as usize;
+        let version = data.get_u8();
+        let asn = data.get_u16();
+        let hold_time = data.get_u16();
+        let mut router_id_bytes = [0u8; 4];
+        data.copy_to_slice(&mut router_id_bytes);
+        let router_id = Ipv4Addr::from(router_id_bytes);
+        let opt_param_len = data.get_u8() as usize;
 
         let mut capabilities = Vec::new();
 
-        if opt_param_len > 0 && data.len() >= 10 + opt_param_len {
-            let opt_data = &data[10..10 + opt_param_len];
-            let mut pos = 0;
+        if opt_param_len > 0 && data.remaining() >= opt_param_len {
+            let mut opt_data = data.copy_to_bytes(opt_param_len);
 
-            while pos < opt_data.len() {
-                if pos + 2 > opt_data.len() {
+            while opt_data.remaining() >= 2 {
+                let param_type = opt_data.get_u8();
+                let param_len = opt_data.get_u8() as usize;
+
+                if opt_data.remaining() < param_len {
                     break;
                 }
 
-                let param_type = opt_data[pos];
-                let param_len = opt_data[pos + 1] as usize;
-                pos += 2;
-
                 if param_type == 2 {
                     // Capabilities
-                    let cap_end = pos + param_len;
-                    while pos < cap_end && pos < opt_data.len() {
-                        match Capability::decode(&opt_data[pos..]) {
-                            Ok((cap, len)) => {
+                    let mut cap_buf = opt_data.copy_to_bytes(param_len);
+                    while cap_buf.has_remaining() {
+                        match Capability::decode(&mut cap_buf) {
+                            Ok(cap) => {
                                 capabilities.push(cap);
-                                pos += len;
                             }
                             Err(_) => break,
                         }
                     }
                 } else {
-                    pos += param_len;
+                    opt_data.advance(param_len);
                 }
             }
         }
@@ -285,35 +290,35 @@ impl OpenMessage {
         })
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Bytes {
         let body = self.encode();
         let length = (BGP_HEADER_LEN + body.len()) as u16;
 
-        let mut buf = Vec::with_capacity(length as usize);
-        buf.extend_from_slice(&BGP_MARKER);
-        buf.extend_from_slice(&length.to_be_bytes());
-        buf.push(MessageType::Open as u8);
-        buf.extend(body);
-        buf
+        let mut buf = BytesMut::with_capacity(length as usize);
+        buf.put_slice(&BGP_MARKER);
+        buf.put_u16(length);
+        buf.put_u8(MessageType::Open as u8);
+        buf.put(body);
+        buf.freeze()
     }
 }
 
 pub struct KeepaliveMessage;
 
 impl KeepaliveMessage {
-    pub fn to_bytes() -> Vec<u8> {
-        let mut buf = Vec::with_capacity(BGP_HEADER_LEN);
-        buf.extend_from_slice(&BGP_MARKER);
-        buf.extend_from_slice(&(BGP_HEADER_LEN as u16).to_be_bytes());
-        buf.push(MessageType::Keepalive as u8);
-        buf
+    pub fn to_bytes() -> Bytes {
+        let mut buf = BytesMut::with_capacity(BGP_HEADER_LEN);
+        buf.put_slice(&BGP_MARKER);
+        buf.put_u16(BGP_HEADER_LEN as u16);
+        buf.put_u8(MessageType::Keepalive as u8);
+        buf.freeze()
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Message {
     Open(OpenMessage),
-    Update(Vec<u8>),
+    Update(Bytes),
     Notification { code: u8, subcode: u8, data: Vec<u8> },
     Keepalive,
 }
@@ -335,15 +340,17 @@ impl Message {
 
         match header.msg_type {
             MessageType::Open => {
-                let open = OpenMessage::decode(&body)?;
+                let mut buf = Bytes::from(body);
+                let open = OpenMessage::decode(&mut buf)?;
                 Ok(Message::Open(open))
             }
-            MessageType::Update => Ok(Message::Update(body)),
+            MessageType::Update => Ok(Message::Update(Bytes::from(body))),
             MessageType::Notification => {
-                let code = body.first().copied().unwrap_or(0);
-                let subcode = body.get(1).copied().unwrap_or(0);
-                let data = if body.len() > 2 {
-                    body[2..].to_vec()
+                let mut buf = Bytes::from(body);
+                let code = if buf.has_remaining() { buf.get_u8() } else { 0 };
+                let subcode = if buf.has_remaining() { buf.get_u8() } else { 0 };
+                let data = if buf.has_remaining() {
+                    buf.to_vec()
                 } else {
                     Vec::new()
                 };
@@ -449,10 +456,11 @@ mod tests {
         let cap = Capability::MultiProtocol { afi: 2, safi: 1 }; // IPv6 unicast
         let encoded = cap.encode();
 
-        assert_eq!(encoded, vec![1, 4, 0, 2, 0, 1]); // Type=1, Len=4, AFI=2, Reserved=0, SAFI=1
+        assert_eq!(&encoded[..], &[1, 4, 0, 2, 0, 1]); // Type=1, Len=4, AFI=2, Reserved=0, SAFI=1
 
-        let (decoded, len) = Capability::decode(&encoded).unwrap();
-        assert_eq!(len, 6);
+        let mut buf = encoded;
+        let decoded = Capability::decode(&mut buf).unwrap();
+        assert_eq!(buf.remaining(), 0);
 
         match decoded {
             Capability::MultiProtocol { afi, safi } => {
@@ -468,10 +476,11 @@ mod tests {
         let cap = Capability::FourOctetAs { asn: 65001 };
         let encoded = cap.encode();
 
-        assert_eq!(encoded, vec![65, 4, 0, 0, 0xFD, 0xE9]); // Type=65, Len=4, ASN=65001
+        assert_eq!(&encoded[..], &[65, 4, 0, 0, 0xFD, 0xE9]); // Type=65, Len=4, ASN=65001
 
-        let (decoded, len) = Capability::decode(&encoded).unwrap();
-        assert_eq!(len, 6);
+        let mut buf = encoded;
+        let decoded = Capability::decode(&mut buf).unwrap();
+        assert_eq!(buf.remaining(), 0);
 
         match decoded {
             Capability::FourOctetAs { asn } => {
@@ -486,7 +495,8 @@ mod tests {
         let cap = Capability::FourOctetAs { asn: 4200000001 };
         let encoded = cap.encode();
 
-        let (decoded, _) = Capability::decode(&encoded).unwrap();
+        let mut buf = encoded;
+        let decoded = Capability::decode(&mut buf).unwrap();
 
         match decoded {
             Capability::FourOctetAs { asn } => {
@@ -498,30 +508,30 @@ mod tests {
 
     #[test]
     fn test_capability_decode_too_short() {
-        let data = vec![1]; // Only 1 byte
-        let result = Capability::decode(&data);
+        let mut data = Bytes::from_static(&[1]); // Only 1 byte
+        let result = Capability::decode(&mut data);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_capability_decode_data_too_short() {
-        let data = vec![1, 4, 0, 2]; // Says length is 4 but only 2 bytes of data
-        let result = Capability::decode(&data);
+        let mut data = Bytes::from_static(&[1, 4, 0, 2]); // Says length is 4 but only 2 bytes of data
+        let result = Capability::decode(&mut data);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_capability_decode_invalid_multiprotocol_length() {
-        let data = vec![1, 3, 0, 2, 1]; // MultiProtocol with length 3 instead of 4
-        let result = Capability::decode(&data);
+        let mut data = Bytes::from_static(&[1, 3, 0, 2, 1]); // MultiProtocol with length 3 instead of 4
+        let result = Capability::decode(&mut data);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_capability_decode_unknown_type() {
-        let data = vec![99, 2, 0x12, 0x34]; // Unknown capability type 99
-        let (cap, len) = Capability::decode(&data).unwrap();
-        assert_eq!(len, 4);
+        let mut data = Bytes::from_static(&[99, 2, 0x12, 0x34]); // Unknown capability type 99
+        let cap = Capability::decode(&mut data).unwrap();
+        assert_eq!(data.remaining(), 0);
         // Returns Unknown capability with preserved data
         match cap {
             Capability::Unknown { code, data } => {
@@ -564,7 +574,8 @@ mod tests {
     fn test_open_message_encode_decode_roundtrip() {
         let original = OpenMessage::new(65001, 180, Ipv4Addr::new(10, 0, 0, 1));
         let encoded = original.encode();
-        let decoded = OpenMessage::decode(&encoded).unwrap();
+        let mut buf = encoded;
+        let decoded = OpenMessage::decode(&mut buf).unwrap();
 
         assert_eq!(decoded.version, original.version);
         assert_eq!(decoded.asn, original.asn);
@@ -606,23 +617,23 @@ mod tests {
 
     #[test]
     fn test_open_message_decode_too_short() {
-        let data = vec![4, 0, 1, 0, 180]; // Only 5 bytes, need at least 10
-        let result = OpenMessage::decode(&data);
+        let mut data = Bytes::from_static(&[4, 0, 1, 0, 180]); // Only 5 bytes, need at least 10
+        let result = OpenMessage::decode(&mut data);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_open_message_decode_minimal() {
         // Minimal valid OPEN: version + asn + hold_time + router_id + opt_param_len
-        let data = vec![
+        let mut data = Bytes::from_static(&[
             4,          // version
             0xFD, 0xE9, // ASN 65001
             0, 180,     // hold_time 180
             10, 0, 0, 1, // router_id 10.0.0.1
             0,          // opt_param_len 0
-        ];
+        ]);
 
-        let decoded = OpenMessage::decode(&data).unwrap();
+        let decoded = OpenMessage::decode(&mut data).unwrap();
 
         assert_eq!(decoded.version, 4);
         assert_eq!(decoded.asn, 65001);
@@ -646,7 +657,8 @@ mod tests {
         };
 
         let encoded = original.encode();
-        let decoded = OpenMessage::decode(&encoded).unwrap();
+        let mut buf = encoded;
+        let decoded = OpenMessage::decode(&mut buf).unwrap();
 
         assert_eq!(decoded.version, 4);
         assert_eq!(decoded.asn, 65002);
@@ -672,7 +684,7 @@ mod tests {
     #[test]
     fn test_message_read_keepalive() {
         let bytes = KeepaliveMessage::to_bytes();
-        let mut cursor = Cursor::new(bytes);
+        let mut cursor = Cursor::new(bytes.to_vec());
 
         let msg = Message::read(&mut cursor).unwrap();
 
@@ -683,7 +695,7 @@ mod tests {
     fn test_message_read_open() {
         let open = OpenMessage::new(65001, 180, Ipv4Addr::new(1, 2, 3, 4));
         let bytes = open.to_bytes();
-        let mut cursor = Cursor::new(bytes);
+        let mut cursor = Cursor::new(bytes.to_vec());
 
         let msg = Message::read(&mut cursor).unwrap();
 
@@ -699,21 +711,21 @@ mod tests {
 
     #[test]
     fn test_message_read_update() {
-        let update_body = vec![0x00, 0x00, 0x00, 0x00]; // Minimal UPDATE body
+        let update_body: &[u8] = &[0x00, 0x00, 0x00, 0x00]; // Minimal UPDATE body
         let length = (BGP_HEADER_LEN + update_body.len()) as u16;
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&BGP_MARKER);
         bytes.extend_from_slice(&length.to_be_bytes());
         bytes.push(MessageType::Update as u8);
-        bytes.extend_from_slice(&update_body);
+        bytes.extend_from_slice(update_body);
 
         let mut cursor = Cursor::new(bytes);
         let msg = Message::read(&mut cursor).unwrap();
 
         match msg {
             Message::Update(body) => {
-                assert_eq!(body, update_body);
+                assert_eq!(&body[..], update_body);
             }
             _ => panic!("Expected Update message"),
         }
@@ -804,12 +816,12 @@ mod tests {
     #[test]
     fn test_message_read_multiple_sequential() {
         // Test reading multiple messages from a stream
-        let mut bytes = Vec::new();
-        bytes.extend(KeepaliveMessage::to_bytes());
-        bytes.extend(KeepaliveMessage::to_bytes());
-        bytes.extend(OpenMessage::new(65001, 180, Ipv4Addr::new(1, 1, 1, 1)).to_bytes());
+        let mut bytes = BytesMut::new();
+        bytes.put(KeepaliveMessage::to_bytes());
+        bytes.put(KeepaliveMessage::to_bytes());
+        bytes.put(OpenMessage::new(65001, 180, Ipv4Addr::new(1, 1, 1, 1)).to_bytes());
 
-        let mut cursor = Cursor::new(bytes);
+        let mut cursor = Cursor::new(bytes.to_vec());
 
         let msg1 = Message::read(&mut cursor).unwrap();
         assert!(matches!(msg1, Message::Keepalive));

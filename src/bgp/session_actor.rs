@@ -8,6 +8,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -17,7 +18,7 @@ use crate::bgp::fsm::{
     AdminEvent, Fsm, FsmAction, FsmConfig, FsmEvent, FsmState, MessageEvent, NotificationError,
     TcpEvent, TimerEvent,
 };
-use crate::bgp::message::{KeepaliveMessage, Message, OpenMessage};
+use crate::bgp::message::{KeepaliveMessage, Message, OpenMessage, BGP_HEADER_LEN, BGP_MARKER, MessageType};
 use crate::bgp::transport::{BgpTransport, TransportError};
 
 /// Commands that can be sent to the session actor.
@@ -27,7 +28,7 @@ pub enum SessionCommand {
     /// Stop the BGP session gracefully.
     Stop,
     /// Send an UPDATE message (body only, without BGP header).
-    SendUpdate(Vec<u8>),
+    SendUpdate(Bytes),
     /// Inject an incoming connection (from TCP listener).
     IncomingConnection(TcpStream),
 }
@@ -62,7 +63,7 @@ pub enum SessionEvent {
     /// Session went down.
     SessionDown { reason: String },
     /// UPDATE message received. Contains raw UPDATE bytes for RIB processing.
-    UpdateReceived(Vec<u8>),
+    UpdateReceived(Bytes),
 }
 
 /// Timer state for the session.
@@ -524,34 +525,30 @@ impl<T: BgpTransport> SessionActor<T> {
     }
 
     /// Build a NOTIFICATION message.
-    fn build_notification(err: &NotificationError) -> Vec<u8> {
-        use crate::bgp::message::{BGP_HEADER_LEN, BGP_MARKER};
-
+    fn build_notification(err: &NotificationError) -> Bytes {
         let body_len = 2 + err.data.len();
         let total_len = (BGP_HEADER_LEN + body_len) as u16;
 
-        let mut buf = Vec::with_capacity(total_len as usize);
-        buf.extend_from_slice(&BGP_MARKER);
-        buf.extend_from_slice(&total_len.to_be_bytes());
-        buf.push(3); // NOTIFICATION message type
-        buf.push(err.code as u8);
-        buf.push(err.subcode);
-        buf.extend_from_slice(&err.data);
-        buf
+        let mut buf = BytesMut::with_capacity(total_len as usize);
+        buf.put_slice(&BGP_MARKER);
+        buf.put_u16(total_len);
+        buf.put_u8(MessageType::Notification as u8);
+        buf.put_u8(err.code as u8);
+        buf.put_u8(err.subcode);
+        buf.put_slice(&err.data);
+        buf.freeze()
     }
 
     /// Build an UPDATE message from body bytes.
-    fn build_update_message(body: &[u8]) -> Vec<u8> {
-        use crate::bgp::message::{BGP_HEADER_LEN, BGP_MARKER};
-
+    fn build_update_message(body: &Bytes) -> Bytes {
         let total_len = (BGP_HEADER_LEN + body.len()) as u16;
 
-        let mut buf = Vec::with_capacity(total_len as usize);
-        buf.extend_from_slice(&BGP_MARKER);
-        buf.extend_from_slice(&total_len.to_be_bytes());
-        buf.push(2); // UPDATE message type
-        buf.extend_from_slice(body);
-        buf
+        let mut buf = BytesMut::with_capacity(total_len as usize);
+        buf.put_slice(&BGP_MARKER);
+        buf.put_u16(total_len);
+        buf.put_u8(MessageType::Update as u8);
+        buf.put_slice(body);
+        buf.freeze()
     }
 }
 
@@ -744,7 +741,7 @@ mod tests {
         transport.queue_receive(Message::Open(peer_open()));
         transport.queue_receive(Message::Keepalive);
 
-        let update_data = vec![0x00, 0x00, 0x00, 0x04, 0x40, 0x01, 0x01, 0x00];
+        let update_data = Bytes::from_static(&[0x00, 0x00, 0x00, 0x04, 0x40, 0x01, 0x01, 0x00]);
         transport.queue_receive(Message::Update(update_data.clone()));
         for _ in 0..5 {
             transport.queue_receive_error(TransportError::Timeout);

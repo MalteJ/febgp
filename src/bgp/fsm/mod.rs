@@ -572,6 +572,7 @@ impl Fsm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     fn default_config() -> FsmConfig {
         FsmConfig {
@@ -881,7 +882,7 @@ mod tests {
         fsm.process_event(FsmEvent::Message(MessageEvent::BgpOpen(valid_peer_open())));
         fsm.process_event(FsmEvent::Message(MessageEvent::KeepAliveMsg));
 
-        let update_data = vec![0x00, 0x00, 0x00, 0x00];
+        let update_data = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00]);
         let actions = fsm.process_event(FsmEvent::Message(MessageEvent::UpdateMsg(update_data.clone())));
 
         assert_eq!(fsm.state(), FsmState::Established);

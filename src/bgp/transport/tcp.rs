@@ -4,6 +4,7 @@ use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::unix::io::AsRawFd;
 
+use bytes::{Buf, Bytes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
@@ -191,17 +192,19 @@ impl TcpTransport {
 
         match msg_type {
             MessageType::Open => {
-                let open = OpenMessage::decode(&body).map_err(|e| {
+                let mut buf = Bytes::from(body);
+                let open = OpenMessage::decode(&mut buf).map_err(|e| {
                     TransportError::InvalidMessage(format!("Invalid OPEN: {}", e))
                 })?;
                 Ok(Message::Open(open))
             }
-            MessageType::Update => Ok(Message::Update(body)),
+            MessageType::Update => Ok(Message::Update(Bytes::from(body))),
             MessageType::Notification => {
-                let code = body.first().copied().unwrap_or(0);
-                let subcode = body.get(1).copied().unwrap_or(0);
-                let data = if body.len() > 2 {
-                    body[2..].to_vec()
+                let mut buf = Bytes::from(body);
+                let code = if buf.has_remaining() { buf.get_u8() } else { 0 };
+                let subcode = if buf.has_remaining() { buf.get_u8() } else { 0 };
+                let data = if buf.has_remaining() {
+                    buf.to_vec()
                 } else {
                     Vec::new()
                 };
@@ -401,7 +404,7 @@ mod tests {
 
         match msg {
             Message::Update(data) => {
-                assert_eq!(data, body);
+                assert_eq!(&data[..], &body[..]);
             }
             _ => panic!("Expected Update"),
         }
